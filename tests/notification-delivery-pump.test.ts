@@ -42,19 +42,24 @@ test('notification maintenance inventory records its separate server credential 
 });
 
 test('notification maintenance accepts only its server credential, never customer or admin sessions', async t => {
-  const previous = { secret: process.env.SMARTSTORE_IMAGE_WORKER_SECRET, store: process.env.SMARTSTORE_MARKETPLACE_STORE, auth: process.env.AUTH_SECRET };
-  const secret = 'isolated-notification-route-worker-secret';
-  process.env.SMARTSTORE_IMAGE_WORKER_SECRET = secret;
-  process.env.SMARTSTORE_MARKETPLACE_STORE = 'file';
-  process.env.AUTH_SECRET = 'isolated-notification-route-session-secret';
+  const secret = 'a'.repeat(64);
+  const imageWorkerSecret = 'b'.repeat(64);
+  const environment = {
+    SMARTSTORE_NOTIFICATION_PUMP_TOKEN: secret,
+    SMARTSTORE_IMAGE_WORKER_SECRET: imageWorkerSecret,
+    SMARTSTORE_MARKETPLACE_STORE: 'file',
+    AUTH_SECRET: 'isolated-notification-route-session-secret',
+  };
+  const previous = Object.fromEntries(Object.keys(environment).map(key => [key, process.env[key]]));
+  Object.assign(process.env, environment);
   t.after(() => {
-    for (const [key, value] of Object.entries({ SMARTSTORE_IMAGE_WORKER_SECRET: previous.secret, SMARTSTORE_MARKETPLACE_STORE: previous.store, AUTH_SECRET: previous.auth })) {
+    for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
   });
   const customer = createSignedSession({ id: 'notification-customer', email: 'customer@example.test', role: 'user' });
   const admin = createSignedSession({ id: 'notification-admin', email: 'admin@example.test', role: 'admin' });
-  const headers: HeadersInit[] = [{}, { Authorization: 'Bearer forged-worker-secret' },
+  const headers: HeadersInit[] = [{}, { Authorization: `Bearer ${imageWorkerSecret}` },
     { Authorization: `Bearer ${customer}` }, { Cookie: `smartstore_session=${admin}` }];
   for (const value of headers) {
     const response = await POST(new Request('http://localhost/api/internal/notifications/drain', { method: 'POST', headers: value }));

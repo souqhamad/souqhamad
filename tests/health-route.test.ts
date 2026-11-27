@@ -46,7 +46,7 @@ test('database health checks do not query or wait for visitor analytics', async 
   mockDatabaseMethod(t, prisma.siteVisitDaily, 'findUnique', async () => { analyticsCalls++; throw new Error('analytics stalled'); });
   mockDatabaseMethod(t, prisma.siteVisitDaily, 'findMany', async () => { analyticsCalls++; throw new Error('analytics stalled'); });
   mockDatabaseMethod(t, prisma, '$queryRaw', async () => {
-    if (!available) throw new Error('database unavailable');
+    if (!available) throw new Error('database unavailable at internal-db.example.test');
     return [{ '?column?': 1 }];
   });
   const healthy = await GET();
@@ -56,7 +56,9 @@ test('database health checks do not query or wait for visitor analytics', async 
   available = false;
   const unavailable = await GET();
   assert.equal(unavailable.status, 503);
-  assert.equal((await unavailable.json()).checks.database, 'error');
+  const unavailableBody = await unavailable.json();
+  assert.deepEqual(unavailableBody.checks, { database: 'error' });
+  assert.doesNotMatch(JSON.stringify(unavailableBody), /internal-db/);
   assert.equal(analyticsCalls, 0);
 });
 
