@@ -1,0 +1,30 @@
+# Supply production.json as a Render Secret File before deploying this service.
+# Set its DATABASE_URL to the internal URL for the existing production database in souqhamad-db.
+services:
+  - type: web
+    name: smartstore-ai-marketplace
+    runtime: node
+    region: frankfurt
+    plan: 1c-2g
+    branch: production
+    autoDeployTrigger: off
+    domains:
+      - souqhamad.com
+    healthCheckPath: /api/health
+    buildCommand: >-
+      corepack prepare pnpm@10.32.1 --activate &&
+      corepack pnpm install --frozen-lockfile --prod=false &&
+      corepack pnpm build
+    startCommand: >-
+      node -e "Object.assign(process.env,require('/etc/secrets/production.json')); import('./scripts/start.mjs')"
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_PUBLIC_APP_URL
+        value: https://souqhamad.com
+      - key: SMARTSTORE_MARKETPLACE_STORE
+        value: database
+      - key: SMARTSTORE_HEALTH_INCLUDE_METRICS
+        value: "0"

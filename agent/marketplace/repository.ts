@@ -1,0 +1,5782 @@
+import type { StaffMutationGuard } from '@/lib/auth/staff-mutation';
+import { createHash, randomUUID } from 'node:crypto';
+
+import type { AuthSessionUser } from '@/lib/auth/session';
+import { prisma } from '@/lib/db/prisma';
+import { createListingId } from '@/lib/marketplace/listing-id';
+import { activePublishedFavoriteWhere } from '@/lib/marketplace/favorite-visibility';
+import { getMarketplaceTitleTerms, publicListingFiltersSql, titleSearchNumberSql, titleSearchConditionSql, type PublicMarketplaceListingFilters } from '@/lib/marketplace/title-search';
+import { createAdminAuditLog } from '@/lib/admin/audit';
+import { recordModelReview } from '@/lib/admin/model-review';
+import { enqueueFollowDeliveries, enqueueNotificationDelivery, scheduleNotificationDelivery } from '@/lib/push/delivery-jobs';
+import {
+  type PaginationInput,
+  normalizePagination,
+  publicMarketplacePaginationOptions,
+  toPaginatedResponse,
+} from '@/lib/pagination';
+import { publishRealtimeEvent } from '@/lib/realtime/event-bus';
+import type {
+  PublishRealtimeEventInput,
+  RealtimeEventVisibility,
+} from '@/lib/realtime/events';
+import {
+  notifySellerFollowersOfPublishedListing,
+  notifySimilarListingFollowersOfPublishedListing,
+} from '@/lib/push/follow-notifications';
+import { Prisma, type AdminAuditAction } from '@prisma/client';
+
+import { createUnassessedMarketplaceCompliance, evaluateListingComplianceBestEffort as evaluateSaudiMarketplaceCompliance } from './policy';
+import { resolveListingCategoryWithModel } from './listing-category-model';
+import { getMarketplaceCategorySearchIds } from '@/lib/marketplace/categories';
+import { mergeMarketplaceCategoryAttributes } from '@/lib/marketplace/category-options';
+import { createComparableListingSelector, getComparableListings } from './market-intelligence';
+import { similarListingCandidateFilterSql } from './similarity-candidate-filter';
+import { listingSemanticText, marketplaceTextAnalyzer } from './text-understanding';
+import {
+  getMarketplaceSearchTermVariants,
+  getMarketplaceCitySearchVariants,
+  normalizeMarketplaceSearchText,
+  parseMarketplaceSearchQuery,
+} from './search';
+import * as memoryStore from './store';
+import type {
+  ComplianceDecision,
+  CommissionRecord,
+  CommissionStatus,
+  Conversation,
+  ConversationBlockStatus,
+  ConversationMessage,
+  FavoriteRecord,
+  ListingCondition,
+    ListingImage,
+  ListingStatus,
+  ReportRecord,
+  UserReportResolution,
+  UserReportStatus,
+} from './types';
+import { evaluateConversationMessageSafety } from './message-safety';
+import {
+  ListingLimitReachedError,
+  hasReachedSellerListingLimit,
+} from './listing-limits';
+import {
+  getMaxListingImagesPerListing,
+  hasReachedListingImageLimit,
+} from './listing-image-limits';
+import { normalizeListingImageDeliveryUrls } from './listing-image-delivery';
+import { recordDatabaseFirstPublication } from './listing-publication';
+import { ensureDatabaseSaleCommission } from './listing-commission';
+import { enqueueImageObjectCleanup, processImageObjectCleanup } from './image-object-cleanup';
+import { sealPreparedListingImageDelivery } from './prepared-image-delivery';
+import { runOptionalTask } from '@/lib/optional-task';
+import { scheduleEvidenceCopy, scheduleListingEvidenceCopy } from './evidence';
+import { activeImageUploadStatuses, directImageUploadsEnabled, DirectImageUploadError, retryDirectImageTransaction } from './direct-image-upload-policy';
+
+type DatabaseListingRecord = {
+  firstPublicationTracked?: boolean;
+  firstPublishedAt?: Date | null;
+  id: string;
+  sellerId: string;
+  category: string;
+  title: string | null;
+  description: string | null;
+  price: unknown;
+  priceMode: string | null;
+  city: string | null;
+  condition: string | null;
+  attributes: unknown;
+  status: string;
+  createdAt: Date;
+  updatedAt: Date;
+  views: number;
+  messageCount: number;
+  favoriteCount: number;
+  compliance: unknown;
+  images?: Array<{
+    contentReviewStatus?: string | null;
+    id: string;
+    listingId: string;
+    originalUrl: string;
+    displayUrl: string;
+    thumbnailUrl: string;
+    isPrimary: boolean;
+    qualityScore: number;
+    status: string;
+    enhancements: string[];
+  }>;
+};
+
+type Actor = AuthSessionUser | string;
+
+type SellerFollowRecord = {
+  id: string;
+  followerId: string;
+  sellerId: string;
+  createdAt: string;
+};
+
+type FollowNotificationRecord = {
+  id: string;
+  userId: string;
+  listingId: string;
+  sellerId: string;
+  title?: string;
+  body?: string;
+  url: string;
+  readAt?: string;
+  createdAt: string;
+};
+
+type FollowNotificationDatabaseRecord = {
+  id: string;
+  userId: string;
+  listingId: string;
+  sellerId: string;
+  title: string | null;
+  body: string | null;
+  url: string;
+  readAt: Date | null;
+  createdAt: Date;
+};
+
+type SimilarListingFollowRecord = {
+  id: string;
+  userId: string;
+  listingId: string;
+  category: string;
+  city?: string;
+  title?: string;
+  createdAt: string;
+};
+
+type SimilarListingFollowDatabaseRecord = {
+  id: string;
+  userId: string;
+  listingId: string;
+  category: string;
+  city: string | null;
+  title: string | null;
+  createdAt: Date;
+  listing?: DatabaseListingRecord | null;
+};
+
+type SellerRatingRecord = {
+  id: string;
+  raterId: string;
+  sellerId: string;
+  rating: number;
+  comment?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+const memorySellerFollows = new Map<string, SellerFollowRecord>();
+const memorySellerRatings = new Map<string, SellerRatingRecord>();
+const memoryFollowNotifications = new Map<string, FollowNotificationRecord>();
+const memorySimilarListingFollows = new Map<string, SimilarListingFollowRecord>();
+
+const marketplacePrisma = prisma as typeof prisma & {
+  followNotification: {
+    createMany(input: {
+      data: Array<{
+        userId: string;
+        listingId: string;
+        sellerId: string;
+        title: string;
+        body: string;
+        url: string;
+      }>;
+      skipDuplicates?: boolean;
+    }): Promise<unknown>;
+    findMany(input: {
+      where: { userId: string };
+      orderBy: { createdAt: 'desc' };
+      take: number;
+    }): Promise<FollowNotificationDatabaseRecord[]>;
+    updateMany(input: {
+      where: { userId: string; readAt: null };
+      data: { readAt: Date };
+    }): Promise<unknown>;
+    deleteMany(input: {
+      where: { id?: string; userId: string };
+    }): Promise<{ count: number }>;
+  };
+  similarListingFollow: {
+    findMany(input: {
+      where: { category?: string; userId?: string; id?: { gt: string } };
+      include?: { listing: { include: { images: true } } };
+      orderBy?: { createdAt: 'desc' } | { id: 'asc' };
+      take?: number;
+    }): Promise<SimilarListingFollowDatabaseRecord[]>;
+    findUnique(input: {
+      where: { userId_listingId: { userId: string; listingId: string } };
+    }): Promise<SimilarListingFollowDatabaseRecord | null>;
+    delete(input: {
+      where: { userId_listingId: { userId: string; listingId: string } };
+    }): Promise<unknown>;
+    create(input: {
+      data: {
+        userId: string;
+        listingId: string;
+        category: string;
+        city?: string;
+        title?: string;
+      };
+    }): Promise<SimilarListingFollowDatabaseRecord>;
+  };
+};
+
+export type PublicSellerProfile = {
+  id: string;
+  name: string;
+  picture?: string;
+  phoneNumber?: string;
+  joinedAt?: string;
+  role: string;
+  publishedListingCount: number;
+  ratingAverage: number;
+  ratingCount: number;
+  followerCount: number;
+  listings: memoryStore.ListingRecord[];
+};
+
+type DatabaseConversationRecord = {
+  id: string;
+  listingId: string;
+  sellerId: string;
+  buyerId: string;
+  status: string;
+  createdAt: Date;
+  updatedAt: Date;
+  messages?: Array<{
+    id: string;
+    conversationId: string;
+    senderId: string;
+    body: string;
+    status: string;
+    type?: string;
+    reasons: string[];
+    metadata?: unknown;
+    createdAt: Date;
+  }>;
+  listing?: DatabaseListingRecord | null;
+  seller?: {
+    id: string;
+    email: string;
+    name: string | null;
+    picture: string | null;
+    lastActiveAt: Date | null;
+    deletedAt: Date | null;
+  } | null;
+  buyer?: {
+    id: string;
+    email: string;
+    name: string | null;
+    picture: string | null;
+    lastActiveAt: Date | null;
+    deletedAt: Date | null;
+  } | null;
+};
+
+type DatabaseFavoriteRecord = {
+  id: string;
+  listingId: string;
+  userId: string;
+  createdAt: Date;
+  listing?: DatabaseListingRecord | null;
+};
+
+type DatabaseReportRecord = {
+  id: string;
+  listingId: string;
+  reporterId: string;
+  reason: string;
+  details: string | null;
+  status: string;
+  createdAt: Date;
+  listing?: DatabaseListingRecord | null;
+};
+
+type DatabaseCommissionRecord = {
+  id: string;
+  listingId: string;
+  sellerId: string;
+  productValue: unknown;
+  commissionRatePercent: unknown;
+  commissionAmount: unknown;
+  status: string;
+  source: string;
+  paidAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  listing?: DatabaseListingRecord | null;
+};
+
+export type MarketplaceListingFilters = {
+  query?: string;
+  category?: string;
+  city?: string;
+  cityVariants?: string[];
+  minPrice?: number;
+  maxPrice?: number;
+  condition?: ListingCondition;
+  yearMin?: number;
+  yearMax?: number;
+  terms?: string[];
+  termGroups?: string[][];
+  excludedTerms?: string[];
+  page?: number;
+  limit?: number;
+  take?: number;
+};
+
+function extractListingIdLookup(value?: string) {
+  const query = value?.trim();
+
+  if (!query) {
+    return null;
+  }
+
+  const listingPathMatch = query.match(/\/listings\/([^/?#\s]+)/i);
+
+  if (listingPathMatch?.[1]) {
+    return decodeURIComponent(listingPathMatch[1]).trim();
+  }
+
+  const idLabelMatch = query.match(
+    /(?:listing|ad|advertisement|إعلان|الاعلان|الإعلان|رقم)\s*[:#-]?\s*([a-z0-9_-]{6,})/i,
+  );
+
+  if (idLabelMatch?.[1]) {
+    return idLabelMatch[1].trim();
+  }
+
+  return /^[a-z0-9_-]{6,}$/i.test(query) ? query : null;
+}
+
+export type CreateListingInput = {
+  autoCategory?: boolean;
+  category: string;
+  title?: string;
+  description?: string;
+  price?: number | 'bid' | 'negotiable';
+  city?: string;
+  condition?: ListingCondition;
+  attributes?: Record<string, unknown>;
+};
+
+export type UpdateListingInput = Omit<Partial<CreateListingInput>, 'description' | 'city' | 'price'> & {
+  description?: string | null;
+  city?: string | null;
+  price?: CreateListingInput['price'] | null;
+};
+
+function shouldUseDatabaseStore() {
+  return process.env.SMARTSTORE_MARKETPLACE_STORE === 'database';
+}
+
+function toSearchText(input: CreateListingInput) {
+  return [
+    input.category,
+    input.title,
+    input.description,
+    input.city,
+    input.condition,
+    Object.values(input.attributes ?? {}).join(' '),
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+function toNormalizedListingSearchText(input: CreateListingInput) {
+  return normalizeMarketplaceSearchText(toSearchText(input));
+}
+
+function chooseInitialStatus(compliance: ComplianceDecision): ListingStatus {
+  if (compliance.decision === 'block') {
+    return 'rejected';
+  }
+
+  if (compliance.decision === 'needs_review') {
+    return 'pending';
+  }
+
+  return 'draft';
+}
+
+function toPriceMode(price: CreateListingInput['price']) {
+  return typeof price === 'number' ? null : price ?? null;
+}
+
+function toNumericPrice(price: CreateListingInput['price']) {
+  return typeof price === 'number' ? price : null;
+}
+
+function toListingPrice(price: unknown, priceMode?: string | null) {
+  if (priceMode === 'bid' || priceMode === 'negotiable') {
+    return priceMode;
+  }
+
+  if (price && typeof price === 'object' && 'toNumber' in price) {
+    return (price as { toNumber: () => number }).toNumber();
+  }
+
+  return typeof price === 'number' ? price : undefined;
+}
+
+function toNumber(value: unknown) {
+  if (value && typeof value === 'object' && 'toNumber' in value) {
+    return (value as { toNumber: () => number }).toNumber();
+  }
+
+  return typeof value === 'number' ? value : null;
+}
+
+function calculateCommissionAmount(productValue: number) {
+  return Math.round(productValue * 0.01 * 100) / 100;
+}
+
+function safelyPublishRealtimeEvent(input: PublishRealtimeEventInput) {
+  try {
+    publishRealtimeEvent(input);
+  } catch {
+    // Realtime notifications must not break marketplace writes.
+  }
+}
+
+function getListingRealtimeVisibility(
+  sellerId: string,
+  status: string,
+): RealtimeEventVisibility {
+  const isPublicListingState =
+    status === 'published' ||
+    status === 'paused' ||
+    status === 'sold' ||
+    status === 'deleted';
+
+  return {
+    includePublic: isPublicListingState,
+    includeAdmins: true,
+    userIds: [sellerId],
+  };
+}
+
+function asRecord(value: unknown) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function toPrismaJsonObject(value: Record<string, unknown>) {
+  return value as Prisma.InputJsonObject;
+}
+
+function isPrismaKnownRequestError(error: unknown, code: string) {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === code
+  );
+}
+
+function isRetryablePrismaWriteConflict(error: unknown) {
+  return (
+    isPrismaKnownRequestError(error, 'P2002') ||
+    isPrismaKnownRequestError(error, 'P2025') ||
+    isPrismaKnownRequestError(error, 'P2034')
+  );
+}
+
+const maxSerializableWriteAttempts = 8;
+
+function waitForSerializableRetry(attempt: number) {
+  return new Promise((resolve) => setTimeout(resolve, 35 * (attempt + 1)));
+}
+
+function getActorId(actor: Actor) {
+  return typeof actor === 'string' ? actor : actor.id;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function getSellerFollowKey(followerId: string, sellerId: string) {
+  return `${followerId}:${sellerId}`;
+}
+
+function getSellerRatingKey(raterId: string, sellerId: string) {
+  return `${raterId}:${sellerId}`;
+}
+
+function getMemorySellerFollowerCount(sellerId: string) {
+  return [...memorySellerFollows.values()].filter(
+    (follow) => follow.sellerId === sellerId,
+  ).length;
+}
+
+async function listSellerFollowerIds(sellerId: string) {
+  if (!shouldUseDatabaseStore()) {
+    return [...memorySellerFollows.values()]
+      .filter((follow) => follow.sellerId === sellerId)
+      .map((follow) => follow.followerId);
+  }
+
+  const followers = await prisma.sellerFollow.findMany({
+    where: { sellerId },
+    select: { followerId: true },
+  });
+
+  return followers.map((follow) => follow.followerId);
+}
+
+function getFollowNotificationKey(userId: string, listingId: string) {
+  return `${userId}:${listingId}`;
+}
+
+function getSimilarListingFollowKey(userId: string, listingId: string) {
+  return `${userId}:${listingId}`;
+}
+
+type FollowNotificationListing = {
+  id: string;
+  sellerId: string;
+  title?: string | null;
+  city?: string | null;
+};
+
+function buildFollowNotificationBody(listing: FollowNotificationListing) {
+  const title = listing.title?.trim() || 'إعلان جديد';
+  const city = listing.city?.trim();
+
+  return city ? `${title} في ${city}` : title;
+}
+
+export async function createFollowNotificationsForListing(
+  listing: FollowNotificationListing,
+  followerIds: string[],
+  options: {
+    title?: string;
+    urlSource?: string;
+  } = {},
+) {
+  const recipients = [...new Set(followerIds)].filter(
+    (userId) => userId && userId !== listing.sellerId,
+  );
+
+  if (recipients.length === 0) {
+    return;
+  }
+
+  const title = options.title ?? 'إعلان جديد من بائع تتابعه';
+  const body = buildFollowNotificationBody(listing);
+  const url = `/listings/${encodeURIComponent(listing.id)}?source=${encodeURIComponent(options.urlSource ?? 'follow')}`;
+
+  if (!shouldUseDatabaseStore()) {
+    for (const userId of recipients) {
+      const key = getFollowNotificationKey(userId, listing.id);
+
+      if (memoryFollowNotifications.has(key)) {
+        continue;
+      }
+
+      memoryFollowNotifications.set(key, {
+        id: randomUUID(),
+        userId,
+        listingId: listing.id,
+        sellerId: listing.sellerId,
+        title,
+        body,
+        url,
+        createdAt: nowIso(),
+      });
+    }
+
+    return;
+  }
+
+  await marketplacePrisma.followNotification.createMany({
+    data: recipients.map((userId) => ({
+      userId,
+      listingId: listing.id,
+      sellerId: listing.sellerId,
+      title,
+      body,
+      url,
+    })),
+    skipDuplicates: true,
+  });
+}
+
+function isSimilarListingMatch(
+  referenceListing: memoryStore.ListingRecord,
+  publishedListing: memoryStore.ListingRecord,
+) {
+  return getComparableListings(referenceListing, [publishedListing]).some(
+    (candidate) => candidate.id === publishedListing.id,
+  );
+}
+
+async function listSimilarListingFollowerIds(
+  listing: memoryStore.ListingRecord,
+): Promise<string[]> {
+  if (!shouldUseDatabaseStore()) {
+    return [...memorySimilarListingFollows.values()]
+      .filter((follow) => follow.userId !== listing.sellerId)
+      .filter((follow) => {
+        const referenceListing = memoryStore.getListing(follow.listingId);
+
+        return Boolean(
+          referenceListing &&
+            referenceListing.status === 'published' &&
+            isSimilarListingMatch(referenceListing, listing),
+        );
+      })
+      .map((follow) => follow.userId);
+  }
+
+  const followerIds: string[] = [];
+  let cursor: string | undefined;
+  // A batch bounds each database read, never the number of eligible followers.
+  // Keyset pagination also avoids duplicate/shifted pages when follows change.
+  while (true) {
+    const follows = await marketplacePrisma.similarListingFollow.findMany({
+      // Follow the current reference listing, including category corrections.
+      where: { listing: { category: listing.category }, ...(cursor ? { id: { gt: cursor } } : {}) },
+      include: { listing: { include: { images: true } } },
+      orderBy: { id: 'asc' },
+      take: 500,
+    });
+    for (const follow of follows) {
+      if (follow.userId === listing.sellerId || !follow.listing || follow.listing.status !== 'published') continue;
+      if (isSimilarListingMatch(toListingRecord(follow.listing), listing)) followerIds.push(follow.userId);
+    }
+    if (follows.length < 500) break;
+    cursor = follows[follows.length - 1].id;
+  }
+
+  return followerIds;
+}
+
+async function notifyFollowersWhenListingIsPublished(
+  listing: memoryStore.ListingRecord,
+  previousStatus: ListingStatus,
+) {
+  if (previousStatus === 'published' || listing.status !== 'published') {
+    return;
+  }
+
+  const followerIds = await listSellerFollowerIds(listing.sellerId);
+
+  if (followerIds.length === 0) {
+    return;
+  }
+
+  await createFollowNotificationsForListing(listing, followerIds);
+
+  safelyPublishRealtimeEvent({
+    type: 'follow_listing_published',
+    payload: {
+      listingId: listing.id,
+      sellerId: listing.sellerId,
+      status: 'published',
+    },
+    visibility: {
+      userIds: followerIds,
+    },
+  });
+
+  try {
+    if (shouldUseDatabaseStore()) {
+      await enqueueFollowDeliveries(listing.id, followerIds, 'seller');
+    } else await notifySellerFollowersOfPublishedListing({ listing, followerIds });
+  } catch (error) {
+    const errorName = error instanceof Error ? error.name : 'UnknownError';
+    console.warn(`[follow_listing_push] failure=${errorName}`);
+    if (shouldUseDatabaseStore()) throw error;
+  }
+}
+
+async function notifySimilarFollowersWhenListingIsPublished(
+  listing: memoryStore.ListingRecord,
+  previousStatus: ListingStatus,
+) {
+  if (previousStatus === 'published' || listing.status !== 'published') {
+    return;
+  }
+
+  const followerIds = [
+    ...new Set(await listSimilarListingFollowerIds(listing)),
+  ].filter((userId) => userId !== listing.sellerId);
+
+  if (followerIds.length === 0) {
+    return;
+  }
+
+  await createFollowNotificationsForListing(listing, followerIds, {
+    title: 'إعلان مشابه جديد',
+    urlSource: 'similar-follow',
+  });
+
+  safelyPublishRealtimeEvent({
+    type: 'listing_notification_created',
+    payload: {
+      listingId: listing.id,
+      sellerId: listing.sellerId,
+      reason: 'similar_listing_follow',
+    },
+    visibility: {
+      userIds: followerIds,
+    },
+  });
+
+  try {
+    if (shouldUseDatabaseStore()) {
+      await enqueueFollowDeliveries(listing.id, followerIds, 'similar');
+    } else await notifySimilarListingFollowersOfPublishedListing({ listing, followerIds });
+  } catch (error) {
+    const errorName = error instanceof Error ? error.name : 'UnknownError';
+    console.warn(`[similar_listing_push] failure=${errorName}`);
+    if (shouldUseDatabaseStore()) throw error;
+  }
+}
+
+export async function deliverPublishedListingNotifications(listingId: string) {
+  const listing = await getListing(listingId);
+  if (!listing || listing.status !== 'published') return;
+  const seller = await prisma.user.findUnique({ where: { id: listing.sellerId }, select: { deletedAt: true } });
+  if (!seller || seller.deletedAt) return;
+  await notifyFollowersWhenListingIsPublished(listing, 'draft');
+  await notifySimilarFollowersWhenListingIsPublished(listing, 'draft');
+}
+
+async function notifyPublishedListingBestEffort(listing: memoryStore.ListingRecord, previousStatus: ListingStatus) {
+  if (shouldUseDatabaseStore()) { scheduleNotificationDelivery(true); return; }
+  await runOptionalTask('listing_follower_notifications', () => notifyFollowersWhenListingIsPublished(listing, previousStatus));
+  await runOptionalTask('listing_similar_notifications', () => notifySimilarFollowersWhenListingIsPublished(listing, previousStatus));
+}
+
+function getMemorySellerRatingStats(sellerId: string) {
+  const ratings = [...memorySellerRatings.values()].filter(
+    (rating) => rating.sellerId === sellerId,
+  );
+  const total = ratings.reduce((sum, rating) => sum + rating.rating, 0);
+
+  return {
+    ratingCount: ratings.length,
+    ratingAverage: ratings.length ? total / ratings.length : 0,
+  };
+}
+
+function getPlaceholderEmail(userId: string) {
+  return `${userId.replace(/[^a-zA-Z0-9._-]/g, '_')}@smartstore.local`;
+}
+
+function getListingPagination(
+  filters: MarketplaceListingFilters,
+  options?: Parameters<typeof normalizePagination>[1],
+) {
+  const pagination = normalizePagination(filters, options);
+
+  return {
+    limit: pagination.limit,
+    page: pagination.page,
+    skip: pagination.skip,
+    take: filters.take ?? pagination.limit,
+  };
+}
+
+function asCompliance(value: unknown): ComplianceDecision {
+  if (value && typeof value === 'object' && 'decision' in value) {
+    return value as ComplianceDecision;
+  }
+
+  return {
+    decision: 'allow',
+    reasons: [],
+    jurisdiction: 'SA',
+    shariaSensitive: false,
+  };
+}
+
+function toListingRecord(listing: DatabaseListingRecord): memoryStore.ListingRecord {
+  return {
+    id: listing.id,
+    sellerId: listing.sellerId,
+    category: listing.category,
+    title: listing.title ?? undefined,
+    description: listing.description ?? undefined,
+    price: toListingPrice(listing.price, listing.priceMode),
+    city: listing.city ?? undefined,
+    condition: listing.condition
+      ? (listing.condition as ListingCondition)
+      : undefined,
+    images:
+      listing.images?.map(
+        (image) =>
+          normalizeListingImageDeliveryUrls({
+            id: image.id,
+            listingId: image.listingId,
+            originalUrl: image.originalUrl,
+            displayUrl: image.displayUrl,
+            thumbnailUrl: image.thumbnailUrl,
+            isPrimary: image.isPrimary,
+            qualityScore: image.qualityScore,
+            status: image.status,
+            enhancements: image.enhancements,
+            contentReviewStatus: image.contentReviewStatus ?? undefined,
+          }) as ListingImage,
+      ) ?? [],
+    attributes: asRecord(listing.attributes),
+    status: listing.status as ListingStatus,
+    firstPublicationTracked: listing.firstPublicationTracked,
+    firstPublishedAt: listing.firstPublishedAt?.toISOString(),
+    createdAt: listing.createdAt.toISOString(),
+    updatedAt: listing.updatedAt.toISOString(),
+    views: listing.views,
+    messageCount: listing.messageCount,
+    favoriteCount: listing.favoriteCount,
+    compliance: asCompliance(listing.compliance),
+  };
+}
+
+function getPublicSellerName(seller: { id: string; name?: string | null }) {
+  const trimmedName = seller.name?.trim();
+
+  if (trimmedName) {
+    return trimmedName;
+  }
+
+  return 'معلن سوق حمد';
+}
+
+async function ensureUser(user: AuthSessionUser) {
+  // Production identities are created only by the verified registration flow.
+  // A request that passed the proxy before deletion must not recreate the old
+  // account or replace canonical fields with its stale session snapshot.
+  if (process.env.NODE_ENV === 'production') {
+    return prisma.user.update({ where: { id: user.id, deletedAt: null }, data: {} });
+  }
+  return prisma.user.upsert({
+    where: { id: user.id },
+    create: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      picture: user.picture,
+    },
+    update: {
+      email: user.email,
+    },
+  });
+}
+
+async function ensureActorUser(actor: Actor) {
+  if (typeof actor !== 'string') {
+    return ensureUser(actor);
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    return prisma.user.update({ where: { id: actor, deletedAt: null }, data: {} });
+  }
+  return prisma.user.upsert({
+    where: { id: actor },
+    create: {
+      id: actor,
+      email: getPlaceholderEmail(actor),
+    },
+    update: {},
+  });
+}
+
+async function getAdminAuditActorId(actor?: Actor, beforeMutation?: StaffMutationGuard) {
+  if (!actor) {
+    return null;
+  }
+
+  // Guarded requests verify and lock the existing staff account in the transaction.
+  // Updating it here would contend with that authorization lock on concurrent requests.
+  if (!beforeMutation) await ensureActorUser(actor);
+  return getActorId(actor);
+}
+
+function conversationMessageMetadata(message: { type?: string; metadata?: unknown }) {
+  const metadata = { ...asRecord(message.metadata) };
+  // Redact old rows as well as newly deleted contact shares. Evidence remains
+  // in its protected snapshot; customer responses must not replay the number.
+  if (message.type === 'message_deleted' || Object.keys(asRecord(metadata.deletedForEveryone)).length) {
+    delete metadata.phoneNumber;
+  }
+  return metadata;
+}
+
+function toConversationRecord(
+  conversation: DatabaseConversationRecord,
+): Conversation & {
+  listing: memoryStore.ListingRecord | null;
+  seller?: {
+    id: string;
+    email: string;
+    name?: string;
+    picture?: string;
+    lastActiveAt?: string;
+    deletedAt?: string;
+  };
+  buyer?: {
+    id: string;
+    email: string;
+    name?: string;
+    picture?: string;
+    lastActiveAt?: string;
+    deletedAt?: string;
+  };
+} {
+  return {
+    id: conversation.id,
+    listingId: conversation.listingId,
+    sellerId: conversation.sellerId,
+    buyerId: conversation.buyerId,
+    status: conversation.status as Conversation['status'],
+    messages:
+      conversation.messages
+        ?.toSorted((left, right) => left.createdAt.getTime() - right.createdAt.getTime())
+        .filter((message) => message.type !== 'conversation_hidden')
+        .map(
+          (message) =>
+            ({
+              id: message.id,
+              conversationId: message.conversationId,
+              senderId: message.senderId,
+              body: message.body,
+              status: message.status,
+              type:
+                message.type === 'contact_share'
+                  ? 'contact_share'
+                  : message.type === 'message_deleted'
+                    ? 'message_deleted'
+                    : 'text',
+              reasons: message.reasons,
+              metadata: conversationMessageMetadata(message),
+              createdAt: message.createdAt.toISOString(),
+            }) as ConversationMessage,
+        ) ?? [],
+    createdAt: conversation.createdAt.toISOString(),
+    updatedAt: conversation.updatedAt.toISOString(),
+    listing: conversation.listing ? toListingRecord(conversation.listing) : null,
+    seller: conversation.seller
+      ? {
+          id: conversation.seller.id,
+          email: conversation.seller.email,
+          name: conversation.seller.name ?? undefined,
+          picture: conversation.seller.picture ?? undefined,
+          lastActiveAt:
+            conversation.seller.lastActiveAt?.toISOString() ?? undefined,
+          deletedAt:
+            conversation.seller.deletedAt?.toISOString() ?? undefined,
+        }
+      : undefined,
+    buyer: conversation.buyer
+      ? {
+          id: conversation.buyer.id,
+          email: conversation.buyer.email,
+          name: conversation.buyer.name ?? undefined,
+          picture: conversation.buyer.picture ?? undefined,
+          lastActiveAt:
+            conversation.buyer.lastActiveAt?.toISOString() ?? undefined,
+          deletedAt:
+            conversation.buyer.deletedAt?.toISOString() ?? undefined,
+        }
+      : undefined,
+  };
+}
+
+function toFavoriteRecord(
+  favorite: DatabaseFavoriteRecord,
+): FavoriteRecord & { listing: memoryStore.ListingRecord | null } {
+  return {
+    id: favorite.id,
+    listingId: favorite.listingId,
+    userId: favorite.userId,
+    createdAt: favorite.createdAt.toISOString(),
+    listing: favorite.listing ? toListingRecord(favorite.listing) : null,
+  };
+}
+
+function toReportRecord(
+  report: DatabaseReportRecord,
+): ReportRecord & { listing: memoryStore.ListingRecord | null } {
+  return {
+    id: report.id,
+    listingId: report.listingId,
+    reporterId: report.reporterId,
+    reason: report.reason,
+    details: report.details ?? undefined,
+    status: report.status as ReportRecord['status'],
+    createdAt: report.createdAt.toISOString(),
+    listing: report.listing ? toListingRecord(report.listing) : null,
+  };
+}
+
+function toCommissionRecord(
+  commission: DatabaseCommissionRecord,
+): CommissionRecord & { listing: memoryStore.ListingRecord | null } {
+  return {
+    id: commission.id,
+    listingId: commission.listingId,
+    sellerId: commission.sellerId,
+    productValue: toNumber(commission.productValue),
+    commissionRatePercent: 1,
+    commissionAmount: toNumber(commission.commissionAmount),
+    status: commission.status as CommissionStatus,
+    source: 'site_sale',
+    paidAt: commission.paidAt?.toISOString(),
+    createdAt: commission.createdAt.toISOString(),
+    updatedAt: commission.updatedAt.toISOString(),
+    listing: commission.listing ? toListingRecord(commission.listing) : null,
+  };
+}
+
+export async function listPublicMarketplaceListings(filters: PublicMarketplaceListingFilters = {}) {
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.listPublicMarketplaceListings(filters);
+  }
+  const terms = getMarketplaceTitleTerms(filters.query);
+  const pagination = getListingPagination(filters, publicMarketplacePaginationOptions);
+  const defaultOrder = terms.length || filters.sort === 'newest'
+    ? Prisma.sql`"updatedAt" DESC, "id" DESC`
+    : Prisma.sql`"firstPublishedAt" DESC NULLS LAST,
+        CASE WHEN "firstPublishedAt" IS NULL THEN "updatedAt" END DESC, "id" DESC`;
+  const order = filters.sort === 'cheapest' ? Prisma.sql`"price" ASC NULLS LAST, ${defaultOrder}`
+    : filters.sort === 'lowest_mileage' ? Prisma.sql`${titleSearchNumberSql('mileage')} ASC NULLS LAST, ${defaultOrder}`
+      : filters.sort === 'best_condition' ? Prisma.sql`${titleSearchConditionSql()} DESC, ${defaultOrder}` : defaultOrder;
+  return prisma.$transaction(async db => {
+    const ids = await db.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT "id" FROM "Listing"
+      WHERE "status" = 'published'
+        AND EXISTS (SELECT 1 FROM "User" seller WHERE seller.id = "Listing"."sellerId" AND seller."deletedAt" IS NULL)
+        AND ${publicListingFiltersSql(filters)}
+      ORDER BY ${order}
+      LIMIT ${pagination.take} OFFSET ${pagination.skip}
+    `);
+    if (!ids.length) return [];
+    const records = await db.listing.findMany({
+      where: { status: 'published', seller: { deletedAt: null }, id: { in: ids.map(item => item.id) } },
+      include: {
+        images: { where: { status: 'approved' }, orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }], take: 1 },
+      },
+    });
+    const positions = new Map(ids.map((item, index) => [item.id, index]));
+    records.sort((left, right) => positions.get(left.id)! - positions.get(right.id)!);
+    return records.map(toListingRecord);
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead });
+}
+
+export async function listMarketplaceListings(
+  filters: MarketplaceListingFilters = {},
+) {
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.listMarketplaceListings(filters);
+  }
+
+  const parsedQuery = parseMarketplaceSearchQuery(filters.query);
+  const listingIdLookup = extractListingIdLookup(filters.query);
+  const pagination = getListingPagination(filters);
+  const searchConditions: Prisma.ListingWhereInput[] = [];
+  const category = filters.category ?? parsedQuery.category;
+  const city = filters.city ?? parsedQuery.city;
+  const minPrice = filters.minPrice ?? parsedQuery.minPrice;
+  const maxPrice = filters.maxPrice ?? parsedQuery.maxPrice;
+  const yearMin = filters.yearMin ?? parsedQuery.yearMin;
+  const yearMax = filters.yearMax ?? parsedQuery.yearMax;
+  const termGroups =
+    listingIdLookup
+      ? []
+      : (filters.termGroups ??
+        (filters.terms?.length ? filters.terms : parsedQuery.terms).map(
+          term => getMarketplaceSearchTermVariants(term, filters.query),
+        ));
+
+  if (listingIdLookup) {
+    searchConditions.push({
+      id: { contains: listingIdLookup, mode: 'insensitive' },
+    });
+  }
+
+  if (category) {
+    const categories = !filters.category && termGroups.length
+      ? getMarketplaceCategorySearchIds(category) : [category];
+    searchConditions.push(categories.length > 1 ? { category: { in: categories } } : { category });
+  }
+
+  if (city) {
+    const cityVariants = filters.cityVariants ?? getMarketplaceCitySearchVariants(city, filters.query);
+
+    searchConditions.push({
+      OR: cityVariants.map((cityVariant) => ({
+        city: { contains: cityVariant, mode: 'insensitive' },
+      })),
+    });
+  }
+
+  if (filters.condition) {
+    searchConditions.push({ condition: filters.condition });
+  }
+
+  if (minPrice !== undefined || maxPrice !== undefined) {
+    searchConditions.push({
+      price: {
+        ...(minPrice !== undefined
+          ? { gte: minPrice }
+          : {}),
+        ...(maxPrice !== undefined
+          ? { lte: maxPrice }
+          : {}),
+      },
+    });
+  }
+
+  if (yearMin !== undefined || yearMax !== undefined) {
+    const currentYear = new Date().getFullYear() + 1;
+    const lowerYear = yearMin ?? 1900;
+    const upperYear = yearMax ?? currentYear;
+    const years = Array.from(
+      { length: Math.max(0, upperYear - lowerYear + 1) },
+      (_, index) => String(lowerYear + index),
+    ).slice(0, 80);
+
+    if (years.length) {
+      searchConditions.push({
+        OR: years.flatMap((year) => [
+          { title: { contains: year, mode: 'insensitive' } },
+          { description: { contains: year, mode: 'insensitive' } },
+          { searchText: { contains: year, mode: 'insensitive' } },
+        ]),
+      });
+    }
+  }
+
+  for (const termGroup of termGroups) {
+    searchConditions.push({
+      OR: termGroup.flatMap((term) => [
+        { title: { contains: term, mode: 'insensitive' } },
+        { description: { contains: term, mode: 'insensitive' } },
+        { city: { contains: term, mode: 'insensitive' } },
+        { category: { contains: term, mode: 'insensitive' } },
+        { searchText: { contains: term, mode: 'insensitive' } },
+      ]),
+    });
+  }
+
+  for (const excludedTerm of filters.excludedTerms ?? []) {
+    searchConditions.push({
+      NOT: {
+        searchText: {
+          contains: normalizeMarketplaceSearchText(excludedTerm),
+          mode: 'insensitive',
+        },
+      },
+    });
+  }
+
+  // Only the unfiltered feed changes ordering. Search and filters keep their old ranking.
+  const readListings = async (db: Prisma.TransactionClient) => {
+    const feedIds = searchConditions.length === 0
+      ? await db.$queryRaw<Array<{ id: string }>>`
+          SELECT "id" FROM "Listing"
+          WHERE "status" = 'published'
+          ORDER BY "firstPublishedAt" DESC NULLS LAST,
+            CASE WHEN "firstPublishedAt" IS NULL THEN "updatedAt" END DESC,
+            "id" DESC
+          LIMIT ${pagination.take} OFFSET ${pagination.skip}
+        `
+      : undefined;
+    const listings = await db.listing.findMany({
+      where: {
+        status: 'published',
+        ...(feedIds ? { id: { in: feedIds.map(listing => listing.id) } } : {}),
+        ...(searchConditions.length ? { AND: searchConditions } : {}),
+      },
+      include: {
+        images: {
+          where: { status: 'approved' },
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          take: 1,
+        },
+      },
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      skip: feedIds ? 0 : pagination.skip,
+      take: pagination.take,
+    });
+
+    if (feedIds) {
+      const positions = new Map(feedIds.map((listing, index) => [listing.id, index]));
+      listings.sort((left, right) => positions.get(left.id)! - positions.get(right.id)!);
+    }
+    return listings.map(toListingRecord);
+  };
+  // Keep ID selection and hydration in the same snapshot during concurrent writes.
+  return searchConditions.length
+    ? readListings(prisma)
+    : prisma.$transaction(readListings, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead });
+}
+
+export async function getListing(listingId: string, options: { publicOnly?: boolean; transaction?: Prisma.TransactionClient } = {}) {
+  if (!shouldUseDatabaseStore()) {
+    const listing = memoryStore.getListing(listingId);
+    return options.publicOnly && listing?.status !== 'published' ? null : listing;
+  }
+
+  const listing = await (options.transaction ?? prisma).listing.findUnique({
+    where: { id: listingId, ...(options.publicOnly ? { status: 'published' as const, seller: { deletedAt: null } } : {}) },
+    include: {
+      images: {
+        orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+      },
+    },
+  });
+
+  return listing ? toListingRecord(listing) : null;
+}
+
+const similarListingLimit = 20;
+const similarListingBatchSize = 512;
+
+/**
+ * Reuse the same deterministic product matcher used by market analysis and
+ * similar-listing follows. Scan eligible records in keyset batches rather
+ * than ranking only the first feed page. Canonical conflicting branches are
+ * excluded in SQL; worst-case cost remains O(published category size).
+ * Memory is bounded by one batch plus the best 20. Media is read only for
+ * the final cards, with fresh public/seller checks instead of cached URLs.
+ */
+export async function listSimilarMarketplaceListings(target: memoryStore.ListingRecord) {
+  if (target.status !== 'published') return [];
+
+  if (!shouldUseDatabaseStore()) {
+    const currentTarget = memoryStore.getListing(target.id);
+    if (!currentTarget || currentTarget.status !== 'published') return [];
+    return getComparableListings(currentTarget, memoryStore.listMarketplaceListings({
+      category: currentTarget.category, take: Number.MAX_SAFE_INTEGER,
+    })).slice(0, similarListingLimit).map(listing => ({
+      ...listing,
+      images: listing.images.filter(image => image.status === 'approved')
+        .sort((left, right) => Number(right.isPrimary) - Number(left.isPrimary)).slice(0, 1),
+    }));
+  }
+
+  const publicWhere = {
+    status: 'published', category: target.category, seller: { deletedAt: null },
+  } satisfies Prisma.ListingWhereInput;
+  const availableTarget = await prisma.listing.findFirst({
+    where: { ...publicWhere, id: target.id }, select: { id: true },
+  });
+  if (!availableTarget) return [];
+
+  let cursor: string | undefined;
+  const bestListings = createComparableListingSelector(target, similarListingLimit);
+  const candidateFilter = similarListingCandidateFilterSql(target);
+  while (true) {
+    const batch = await prisma.$queryRaw<Array<Pick<DatabaseListingRecord,
+      'id' | 'sellerId' | 'category' | 'title' | 'description' | 'attributes' | 'city' | 'createdAt' | 'updatedAt'
+    >>>(Prisma.sql`
+      SELECT "id", "sellerId", "category", "title", "description", "attributes", "city", "createdAt", "updatedAt"
+      FROM "Listing"
+      WHERE "status" = 'published' AND "category" = ${target.category} AND "id" <> ${target.id}
+        AND EXISTS (SELECT 1 FROM "User" seller WHERE seller.id = "Listing"."sellerId" AND seller."deletedAt" IS NULL)
+        AND ${candidateFilter}
+        ${cursor ? Prisma.sql`AND "id" > ${cursor}` : Prisma.empty}
+      ORDER BY "id" ASC LIMIT ${similarListingBatchSize}
+    `);
+    for (const row of batch) bestListings.add(toListingRecord({
+      ...row, price: null, priceMode: null, condition: null,
+      status: 'published', views: 0, messageCount: 0, favoriteCount: 0, compliance: null,
+    }));
+    if (batch.length < similarListingBatchSize) break;
+    cursor = batch[batch.length - 1].id;
+  }
+  const best = bestListings.list();
+  if (!best.length) return [];
+
+  // Re-read after ranking: a concurrent pause/deletion or rejected image must
+  // not leak through a stale candidate snapshot. Include at most one image.
+  const listings = await prisma.listing.findMany({
+    where: { ...publicWhere, id: { in: best.map(listing => listing.id) } },
+    include: {
+      images: {
+        where: { status: 'approved' },
+        orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+        take: 1,
+      },
+    },
+  });
+  return getComparableListings(target, listings.map(toListingRecord)).slice(0, similarListingLimit);
+}
+
+export async function getPublicSellerProfile(
+  sellerId: string,
+  options: { includeListings?: boolean } = {},
+): Promise<PublicSellerProfile | null> {
+  if (!shouldUseDatabaseStore()) {
+    const publishedListings = memoryStore
+      .listSellerListings(sellerId)
+      .filter((listing) => listing.status === 'published');
+
+    if (publishedListings.length === 0) {
+      return null;
+    }
+
+    const ratingStats = getMemorySellerRatingStats(sellerId);
+
+    return {
+      id: sellerId,
+      name: getPublicSellerName({ id: sellerId }),
+      role: 'user',
+      phoneNumber: undefined,
+      publishedListingCount: publishedListings.length,
+      ratingAverage: ratingStats.ratingAverage,
+      ratingCount: ratingStats.ratingCount,
+      followerCount: getMemorySellerFollowerCount(sellerId),
+      listings: options.includeListings === false ? [] : publishedListings,
+    };
+  }
+
+  const [
+    seller,
+    listings,
+    publishedListingCount,
+    followerCount,
+    ratingAggregate,
+  ] = await Promise.all([
+    prisma.user.findUnique({
+      where: { id: sellerId },
+      select: {
+        id: true,
+        name: true,
+        picture: true,
+        phoneNumber: true,
+        role: true,
+        createdAt: true,
+        deletedAt: true,
+      },
+    }),
+    options.includeListings === false ? Promise.resolve([]) : prisma.listing.findMany({
+      where: {
+        sellerId,
+        status: 'published',
+      },
+      include: {
+        images: {
+          where: { status: 'approved' },
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          take: 1,
+        },
+      },
+      orderBy: { updatedAt: 'desc' },
+    }),
+    prisma.listing.count({
+      where: {
+        sellerId,
+        status: 'published',
+      },
+    }),
+    prisma.sellerFollow.count({
+      where: { sellerId },
+    }),
+    prisma.sellerRating.aggregate({
+      where: { sellerId },
+      _avg: { rating: true },
+      _count: { rating: true },
+    }),
+  ]);
+
+  if (!seller || seller.deletedAt) {
+    return null;
+  }
+
+  return {
+    id: seller.id,
+    name: getPublicSellerName(seller),
+    picture: seller.picture ?? undefined,
+    phoneNumber: seller.phoneNumber ?? undefined,
+    joinedAt: seller.createdAt.toISOString(),
+    role: seller.role,
+    publishedListingCount,
+    ratingAverage: ratingAggregate._avg.rating ?? 0,
+    ratingCount: ratingAggregate._count.rating,
+    followerCount,
+    listings: listings.map(toListingRecord),
+  };
+}
+
+export async function listSellerListings(sellerId: string) {
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.listSellerListings(sellerId);
+  }
+
+  const listings = await prisma.listing.findMany({
+    where: {
+      sellerId,
+      status: { not: 'deleted' },
+    },
+    include: {
+      images: {
+        orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+      },
+    },
+    orderBy: { updatedAt: 'desc' },
+  });
+
+  return listings.map(toListingRecord);
+}
+
+export async function getSellerFollowState(sellerId: string, follower: Actor) {
+  const followerId = getActorId(follower);
+
+  if (followerId === sellerId) {
+    return {
+      status: 'self_follow_blocked' as const,
+      isFollowing: false,
+      followerCount: 0,
+      canFollow: false,
+    };
+  }
+
+  if (!shouldUseDatabaseStore()) {
+    return {
+      status: 'ok' as const,
+      isFollowing: memorySellerFollows.has(
+        getSellerFollowKey(followerId, sellerId),
+      ),
+      followerCount: getMemorySellerFollowerCount(sellerId),
+      canFollow: true,
+    };
+  }
+
+  const [seller, existingFollow, followerCount] = await Promise.all([
+    prisma.user.findFirst({
+      where: { id: sellerId, deletedAt: null },
+      select: { id: true },
+    }),
+    prisma.sellerFollow.findUnique({
+      where: {
+        followerId_sellerId: {
+          followerId,
+          sellerId,
+        },
+      },
+    }),
+    prisma.sellerFollow.count({ where: { sellerId } }),
+  ]);
+
+  if (!seller) {
+    return {
+      status: 'not_found' as const,
+      isFollowing: false,
+      followerCount: 0,
+      canFollow: false,
+    };
+  }
+
+  return {
+    status: 'ok' as const,
+    isFollowing: Boolean(existingFollow),
+    followerCount,
+    canFollow: true,
+  };
+}
+
+export async function listAccountFollows(actor: Actor) {
+  const userId = getActorId(actor);
+
+  if (!shouldUseDatabaseStore()) {
+    const similarListingFollows = [...memorySimilarListingFollows.values()]
+      .filter((follow) => follow.userId === userId)
+      .filter((follow) => memoryStore.getListing(follow.listingId)?.status === 'published')
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .map((follow) => {
+        const listing = memoryStore.getListing(follow.listingId);
+        const image = listing?.images
+          ?.filter((listingImage) => listingImage.status === 'approved')
+          .sort((left, right) => Number(right.isPrimary) - Number(left.isPrimary))
+          .at(0) ?? listing?.images?.[0];
+
+        return {
+          id: follow.id,
+          listingId: follow.listingId,
+          title: listing?.title ?? follow.title ?? 'إعلان مشابه',
+          city: listing?.city ?? follow.city,
+          category: listing?.category ?? follow.category,
+          image: image?.thumbnailUrl ?? image?.displayUrl ?? image?.originalUrl,
+          createdAt: follow.createdAt,
+        };
+      });
+    const following = [...memorySellerFollows.values()]
+      .filter((follow) => follow.followerId === userId)
+      .map((follow) => ({
+        id: follow.id,
+        userId: follow.sellerId,
+        name: getPublicSellerName({ id: follow.sellerId }),
+        picture: undefined as string | undefined,
+        createdAt: follow.createdAt,
+        publishedListingCount: memoryStore
+          .listSellerListings(follow.sellerId)
+          .filter((listing) => listing.status === 'published').length,
+        isFollowing: true,
+      }));
+    const followers = [...memorySellerFollows.values()]
+      .filter((follow) => follow.sellerId === userId)
+      .map((follow) => ({
+        id: follow.id,
+        userId: follow.followerId,
+        name: getPublicSellerName({ id: follow.followerId }),
+        picture: undefined as string | undefined,
+        createdAt: follow.createdAt,
+        publishedListingCount: memoryStore
+          .listSellerListings(follow.followerId)
+          .filter((listing) => listing.status === 'published').length,
+        isFollowing: memorySellerFollows.has(
+          getSellerFollowKey(userId, follow.followerId),
+        ),
+      }));
+
+    return {
+      following,
+      followers,
+      similarListingFollows,
+      followingCount: following.length,
+      followerCount: followers.length,
+      similarListingFollowCount: similarListingFollows.length,
+    };
+  }
+
+  const [followingRecords, followerRecords, similarListingFollowRecords] = await Promise.all([
+    prisma.sellerFollow.findMany({
+      where: { followerId: userId, seller: { deletedAt: null } },
+      include: {
+        seller: {
+          select: {
+            id: true,
+            name: true,
+            picture: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    }),
+    prisma.sellerFollow.findMany({
+      where: { sellerId: userId, follower: { deletedAt: null } },
+      include: {
+        follower: {
+          select: {
+            id: true,
+            name: true,
+            picture: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    }),
+    marketplacePrisma.similarListingFollow.findMany({
+      where: { userId, listing: { status: 'published' } },
+      include: {
+        listing: {
+          include: {
+            images: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    }),
+  ]);
+  const relatedUserIds = [
+    ...new Set([
+      ...followingRecords.map((follow) => follow.sellerId),
+      ...followerRecords.map((follow) => follow.followerId),
+    ]),
+  ];
+  const [listingCounts, viewerFollowing] = await Promise.all([
+    relatedUserIds.length
+      ? prisma.listing.groupBy({
+          by: ['sellerId'],
+          where: {
+            sellerId: { in: relatedUserIds },
+            status: 'published',
+          },
+          _count: { _all: true },
+        })
+      : [],
+    relatedUserIds.length
+      ? prisma.sellerFollow.findMany({
+          where: {
+            followerId: userId,
+            sellerId: { in: relatedUserIds },
+          },
+          select: { sellerId: true },
+        })
+      : [],
+  ]);
+  const countBySellerId = new Map(
+    listingCounts.map((count) => [count.sellerId, count._count._all]),
+  );
+  const viewerFollowingIds = new Set(
+    viewerFollowing.map((follow) => follow.sellerId),
+  );
+
+  return {
+    following: followingRecords.map((follow) => ({
+      id: follow.id,
+      userId: follow.seller.id,
+      name: getPublicSellerName(follow.seller),
+      picture: follow.seller.picture ?? undefined,
+      createdAt: follow.createdAt.toISOString(),
+      publishedListingCount: countBySellerId.get(follow.seller.id) ?? 0,
+      isFollowing: true,
+    })),
+    followers: followerRecords.map((follow) => ({
+      id: follow.id,
+      userId: follow.follower.id,
+      name: getPublicSellerName(follow.follower),
+      picture: follow.follower.picture ?? undefined,
+      createdAt: follow.createdAt.toISOString(),
+      publishedListingCount: countBySellerId.get(follow.follower.id) ?? 0,
+      isFollowing: viewerFollowingIds.has(follow.follower.id),
+    })),
+    similarListingFollows: similarListingFollowRecords.map((follow) => {
+      const primaryImage =
+        follow.listing?.images
+          ?.filter((image) => image.status === 'approved')
+          .sort((left, right) => Number(right.isPrimary) - Number(left.isPrimary))
+          .at(0);
+
+      return {
+        id: follow.id,
+        listingId: follow.listingId,
+        title: follow.listing?.title ?? follow.title ?? 'إعلان مشابه',
+        city: follow.listing?.city ?? follow.city ?? undefined,
+        category: follow.listing?.category ?? follow.category,
+        image:
+          primaryImage?.thumbnailUrl ??
+          primaryImage?.displayUrl ??
+          primaryImage?.originalUrl,
+        createdAt: follow.createdAt.toISOString(),
+      };
+    }),
+    followingCount: followingRecords.length,
+    followerCount: followerRecords.length,
+    similarListingFollowCount: similarListingFollowRecords.length,
+  };
+}
+
+export async function listAccountFollowNotifications(actor: Actor) {
+  const userId = getActorId(actor);
+
+  if (!shouldUseDatabaseStore()) {
+    const notifications = [...memoryFollowNotifications.values()]
+      .filter((notification) => notification.userId === userId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+
+    return {
+      notifications,
+      unreadCount: notifications.filter((notification) => !notification.readAt)
+        .length,
+    };
+  }
+
+  const notifications = await marketplacePrisma.followNotification.findMany({
+    where: { userId },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+  });
+
+  return {
+    notifications: notifications.map(
+      (notification: {
+        id: string;
+        userId: string;
+        listingId: string;
+        sellerId: string;
+        title: string | null;
+        body: string | null;
+        url: string;
+        readAt: Date | null;
+        createdAt: Date;
+      }) => ({
+        id: notification.id,
+        userId: notification.userId,
+        listingId: notification.listingId,
+        sellerId: notification.sellerId,
+        title: notification.title ?? undefined,
+        body: notification.body ?? undefined,
+        url: notification.url,
+        readAt: notification.readAt?.toISOString(),
+        createdAt: notification.createdAt.toISOString(),
+      }),
+    ),
+    unreadCount: notifications.filter(
+      (notification: { readAt: Date | null }) => !notification.readAt,
+    ).length,
+  };
+}
+
+export async function markAccountFollowNotificationsRead(actor: Actor) {
+  const userId = getActorId(actor);
+  const readAt = nowIso();
+
+  if (!shouldUseDatabaseStore()) {
+    for (const [key, notification] of memoryFollowNotifications) {
+      if (notification.userId !== userId || notification.readAt) {
+        continue;
+      }
+
+      memoryFollowNotifications.set(key, {
+        ...notification,
+        readAt,
+      });
+    }
+
+    return { readAt };
+  }
+
+  await marketplacePrisma.followNotification.updateMany({
+    where: {
+      userId,
+      readAt: null,
+    },
+    data: {
+      readAt: new Date(readAt),
+    },
+  });
+
+  return { readAt };
+}
+
+export async function deleteAccountFollowNotification(
+  actor: Actor,
+  notificationId: string,
+) {
+  const userId = getActorId(actor);
+
+  if (!shouldUseDatabaseStore()) {
+    for (const [key, notification] of memoryFollowNotifications) {
+      if (notification.id !== notificationId || notification.userId !== userId) {
+        continue;
+      }
+
+      memoryFollowNotifications.delete(key);
+      return { deleted: true };
+    }
+
+    return { deleted: false };
+  }
+
+  const result = await marketplacePrisma.followNotification.deleteMany({
+    where: {
+      id: notificationId,
+      userId,
+    },
+  });
+
+  return { deleted: result.count > 0 };
+}
+
+export async function deleteAccountFollowNotifications(actor: Actor) {
+  const userId = getActorId(actor);
+
+  if (!shouldUseDatabaseStore()) {
+    for (const [key, notification] of memoryFollowNotifications) {
+      if (notification.userId === userId) {
+        memoryFollowNotifications.delete(key);
+      }
+    }
+
+    return { deleted: true };
+  }
+
+  await marketplacePrisma.followNotification.deleteMany({
+    where: { userId },
+  });
+
+  return { deleted: true };
+}
+
+export async function getSimilarListingFollowState(
+  listingId: string,
+  actor: Actor,
+) {
+  const userId = getActorId(actor);
+  const listing = await getListing(listingId);
+
+  if (!listing || listing.status !== 'published') {
+    return {
+      status: 'not_found' as const,
+      isFollowing: false,
+      canFollow: false,
+    };
+  }
+
+  if (!shouldUseDatabaseStore()) {
+    return {
+      status: 'ok' as const,
+      isFollowing: memorySimilarListingFollows.has(
+        getSimilarListingFollowKey(userId, listing.id),
+      ),
+      canFollow: true,
+    };
+  }
+
+  const existingFollow = await marketplacePrisma.similarListingFollow.findUnique({
+    where: {
+      userId_listingId: {
+        userId,
+        listingId: listing.id,
+      },
+    },
+  });
+
+  return {
+    status: 'ok' as const,
+    isFollowing: Boolean(existingFollow),
+    canFollow: true,
+  };
+}
+
+export async function toggleSimilarListingFollow(
+  listingId: string,
+  actor: Actor,
+) {
+  const userId = getActorId(actor);
+  const listing = await getListing(listingId);
+
+  if (!listing || listing.status !== 'published') {
+    return {
+      status: 'not_found' as const,
+      isFollowing: false,
+      canFollow: false,
+    };
+  }
+
+  if (!shouldUseDatabaseStore()) {
+    const key = getSimilarListingFollowKey(userId, listing.id);
+
+    if (memorySimilarListingFollows.has(key)) {
+      memorySimilarListingFollows.delete(key);
+
+      return {
+        status: 'unfollowed' as const,
+        isFollowing: false,
+        canFollow: true,
+      };
+    }
+
+    memorySimilarListingFollows.set(key, {
+      id: `similar-follow:${key}`,
+      userId,
+      listingId: listing.id,
+      category: listing.category,
+      city: listing.city,
+      title: listing.title,
+      createdAt: nowIso(),
+    });
+
+    return {
+      status: 'followed' as const,
+      isFollowing: true,
+      canFollow: true,
+    };
+  }
+
+  await ensureActorUser(actor);
+
+  return prisma.$transaction(async tx => {
+    const key = JSON.stringify(['similar-follow', userId, listing.id]);
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(771208, hashtext(${key}))`;
+    const where = { userId_listingId: { userId, listingId: listing.id } };
+    const existingFollow = await tx.similarListingFollow.findUnique({ where });
+    if (existingFollow) {
+      await tx.similarListingFollow.delete({ where });
+      return { status: 'unfollowed' as const, isFollowing: false, canFollow: true };
+    }
+    await tx.similarListingFollow.create({ data: {
+      userId, listingId: listing.id, category: listing.category,
+      city: listing.city, title: listing.title,
+    } });
+    return { status: 'followed' as const, isFollowing: true, canFollow: true };
+  });
+}
+
+export async function toggleSellerFollow(sellerId: string, follower: Actor) {
+  const followerId = getActorId(follower);
+
+  if (followerId === sellerId) {
+    return {
+      status: 'self_follow_blocked' as const,
+      isFollowing: false,
+      followerCount: 0,
+    };
+  }
+
+  if (!shouldUseDatabaseStore()) {
+    const key = getSellerFollowKey(followerId, sellerId);
+
+    if (memorySellerFollows.has(key)) {
+      memorySellerFollows.delete(key);
+
+      return {
+        status: 'unfollowed' as const,
+        isFollowing: false,
+        followerCount: getMemorySellerFollowerCount(sellerId),
+      };
+    }
+
+    memorySellerFollows.set(key, {
+      id: `follow:${key}`,
+      followerId,
+      sellerId,
+      createdAt: nowIso(),
+    });
+
+    return {
+      status: 'followed' as const,
+      isFollowing: true,
+      followerCount: getMemorySellerFollowerCount(sellerId),
+    };
+  }
+
+  const seller = await prisma.user.findFirst({
+    where: { id: sellerId, deletedAt: null },
+    select: { id: true },
+  });
+
+  if (!seller) {
+    return {
+      status: 'not_found' as const,
+      isFollowing: false,
+      followerCount: 0,
+    };
+  }
+
+  await ensureActorUser(follower);
+
+  return prisma.$transaction(async tx => {
+    const key = JSON.stringify(['seller-follow', followerId, sellerId]);
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(771208, hashtext(${key}))`;
+    const existingFollow = await tx.sellerFollow.findUnique({
+      where: { followerId_sellerId: { followerId, sellerId } },
+    });
+    if (existingFollow) {
+      await tx.sellerFollow.delete({ where: { id: existingFollow.id } });
+      return { status: 'unfollowed' as const, isFollowing: false,
+        followerCount: await tx.sellerFollow.count({ where: { sellerId } }) };
+    }
+    await tx.sellerFollow.create({ data: { followerId, sellerId } });
+    return { status: 'followed' as const, isFollowing: true,
+      followerCount: await tx.sellerFollow.count({ where: { sellerId } }) };
+  });
+}
+
+export async function getSellerRatingState(sellerId: string, rater: Actor) {
+  const raterId = getActorId(rater);
+
+  if (raterId === sellerId) {
+    return {
+      status: 'self_rating_blocked' as const,
+      ratingAverage: 0,
+      ratingCount: 0,
+      myRating: null,
+    };
+  }
+
+  if (!shouldUseDatabaseStore()) {
+    const stats = getMemorySellerRatingStats(sellerId);
+    const rating = memorySellerRatings.get(getSellerRatingKey(raterId, sellerId));
+
+    return {
+      status: 'ok' as const,
+      ...stats,
+      myRating: rating
+        ? { rating: rating.rating, comment: rating.comment }
+        : null,
+    };
+  }
+
+  const [seller, rating, aggregate] = await Promise.all([
+    prisma.user.findFirst({
+      where: { id: sellerId, deletedAt: null },
+      select: { id: true },
+    }),
+    prisma.sellerRating.findUnique({
+      where: {
+        raterId_sellerId: {
+          raterId,
+          sellerId,
+        },
+      },
+    }),
+    prisma.sellerRating.aggregate({
+      where: { sellerId },
+      _avg: { rating: true },
+      _count: { rating: true },
+    }),
+  ]);
+
+  if (!seller) {
+    return {
+      status: 'not_found' as const,
+      ratingAverage: 0,
+      ratingCount: 0,
+      myRating: null,
+    };
+  }
+
+  return {
+    status: 'ok' as const,
+    ratingAverage: aggregate._avg.rating ?? 0,
+    ratingCount: aggregate._count.rating,
+    myRating: rating
+      ? { rating: rating.rating, comment: rating.comment ?? undefined }
+      : null,
+  };
+}
+
+export async function rateSeller(
+  sellerId: string,
+  rater: Actor,
+  input: { rating: number; comment?: string },
+) {
+  const raterId = getActorId(rater);
+  const rating = Math.trunc(input.rating);
+  const comment = input.comment?.trim() || undefined;
+
+  if (raterId === sellerId) {
+    return {
+      status: 'self_rating_blocked' as const,
+      ratingAverage: 0,
+      ratingCount: 0,
+      myRating: null,
+    };
+  }
+
+  if (rating < 1 || rating > 5) {
+    return {
+      status: 'invalid_rating' as const,
+      ratingAverage: 0,
+      ratingCount: 0,
+      myRating: null,
+    };
+  }
+
+  if (!shouldUseDatabaseStore()) {
+    const key = getSellerRatingKey(raterId, sellerId);
+    const existing = memorySellerRatings.get(key);
+    const timestamp = nowIso();
+
+    memorySellerRatings.set(key, {
+      id: existing?.id ?? `rating:${key}`,
+      raterId,
+      sellerId,
+      rating,
+      comment,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    });
+
+    const stats = getMemorySellerRatingStats(sellerId);
+
+    return {
+      status: existing ? 'updated' as const : 'created' as const,
+      ...stats,
+      myRating: { rating, comment },
+    };
+  }
+
+  const seller = await prisma.user.findFirst({
+    where: { id: sellerId, deletedAt: null },
+    select: { id: true },
+  });
+
+  if (!seller) {
+    return {
+      status: 'not_found' as const,
+      ratingAverage: 0,
+      ratingCount: 0,
+      myRating: null,
+    };
+  }
+
+  await ensureActorUser(rater);
+
+  const savedRating = await prisma.sellerRating.upsert({
+    where: {
+      raterId_sellerId: {
+        raterId,
+        sellerId,
+      },
+    },
+    create: {
+      raterId,
+      sellerId,
+      rating,
+      comment,
+    },
+    update: {
+      rating,
+      comment,
+    },
+  });
+  const aggregate = await prisma.sellerRating.aggregate({
+    where: { sellerId },
+    _avg: { rating: true },
+    _count: { rating: true },
+  });
+
+  return {
+    status:
+      savedRating.createdAt.getTime() === savedRating.updatedAt.getTime()
+        ? 'created' as const
+        : 'updated' as const,
+    ratingAverage: aggregate._avg.rating ?? 0,
+    ratingCount: aggregate._count.rating,
+    myRating: {
+      rating: savedRating.rating,
+      comment: savedRating.comment ?? undefined,
+    },
+  };
+}
+
+export async function reportUserDirect(
+  targetUserId: string,
+  reporter: Actor,
+  input: { reason: string; details?: string },
+) {
+  const reporterId = getActorId(reporter);
+
+  if (reporterId === targetUserId) {
+    return {
+      status: 'self_report_blocked' as const,
+      report: null,
+    };
+  }
+
+  if (!shouldUseDatabaseStore()) {
+    return {
+      status: 'reported' as const,
+      report: {
+        id: `user-report:${reporterId}:${targetUserId}`,
+        reporterId,
+        targetUserId,
+        reason: input.reason,
+        details: input.details,
+        status: 'open' as const,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      },
+    };
+  }
+
+  const targetUser = await prisma.user.findFirst({
+    where: { id: targetUserId, deletedAt: null },
+    select: { id: true },
+  });
+
+  if (!targetUser) {
+    return {
+      status: 'not_found' as const,
+      report: null,
+    };
+  }
+
+  const existingOpenReport = await prisma.userReport.findFirst({
+    where: {
+      reporterId,
+      targetUserId,
+      conversationId: null,
+      status: 'open',
+    },
+  });
+
+  if (existingOpenReport) {
+    return {
+      status: 'already_reported' as const,
+      report: {
+        id: existingOpenReport.id,
+        reporterId: existingOpenReport.reporterId,
+        targetUserId: existingOpenReport.targetUserId,
+        reason: existingOpenReport.reason,
+        details: existingOpenReport.details ?? undefined,
+        status: existingOpenReport.status,
+        createdAt: existingOpenReport.createdAt.toISOString(),
+        updatedAt: existingOpenReport.updatedAt.toISOString(),
+      },
+    };
+  }
+
+  await ensureActorUser(reporter);
+
+  const report = await prisma.$transaction(async tx => {
+    const created = await tx.userReport.create({
+      data: {
+        reporterId,
+        targetUserId,
+        reason: input.reason,
+        details: input.details,
+        status: 'open',
+      },
+    });
+    await tx.evidenceCase.findUniqueOrThrow({ where: { sourceType_sourceId: { sourceType: 'UserReport', sourceId: created.id } } });
+    return created;
+  })
+    .catch(async (error) => {
+      if (
+        !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+        error.code !== 'P2002'
+      ) {
+        throw error;
+      }
+
+      return prisma.userReport.findFirstOrThrow({
+        where: {
+          reporterId,
+          targetUserId,
+          conversationId: null,
+          status: 'open',
+        },
+      });
+    });
+
+  scheduleEvidenceCopy('UserReport', report.id);
+
+  return {
+    status: 'reported' as const,
+    report: {
+      id: report.id,
+      reporterId: report.reporterId,
+      targetUserId: report.targetUserId,
+      reason: report.reason,
+      details: report.details ?? undefined,
+      status: report.status,
+      createdAt: report.createdAt.toISOString(),
+      updatedAt: report.updatedAt.toISOString(),
+    },
+  };
+}
+
+export async function listSellerListingsPage(
+  sellerId: string,
+  filters: PaginationInput = {},
+) {
+  const pagination = normalizePagination(filters, {
+    defaultLimit: 24,
+    maxLimit: 48,
+  });
+
+  if (!shouldUseDatabaseStore()) {
+    return toPaginatedResponse(
+      memoryStore
+        .listSellerListings(sellerId)
+        .slice(pagination.skip, pagination.skip + pagination.take),
+      pagination,
+    );
+  }
+
+  const listings = await prisma.listing.findMany({
+    where: {
+      sellerId,
+      status: { not: 'deleted' },
+    },
+    include: {
+      images: {
+        orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+      },
+    },
+    orderBy: { updatedAt: 'desc' },
+    skip: pagination.skip,
+    take: pagination.take,
+  });
+
+  return toPaginatedResponse(listings.map(toListingRecord), pagination);
+}
+
+export async function createListingDraft(
+  user: AuthSessionUser,
+  input: CreateListingInput,
+  options: { idempotencyKey?: string; modelReview?: boolean } = {},
+) {
+  const id = createListingId(user.id, options.idempotencyKey);
+  const replayIds = options.idempotencyKey ? [`chat-draft-${options.idempotencyKey}`, id] : [];
+  for (const replayId of replayIds) {
+    const saved = await getListing(replayId);
+    if (saved) {
+      if (saved.sellerId !== user.id) throw new Error('Draft operation ownership mismatch.');
+      return saved;
+    }
+  }
+  if (options.modelReview) {
+    await marketplaceTextAnalyzer.analyze(listingSemanticText({ ...input, attributes: input.attributes ?? {} }));
+    input = { ...input, category: await resolveListingCategoryWithModel(input) };
+  }
+  input = { ...input, attributes: mergeMarketplaceCategoryAttributes(input.category, input.attributes) };
+  const compliance = options.modelReview
+    ? evaluateSaudiMarketplaceCompliance(listingSemanticText({ ...input, attributes: input.attributes ?? {} }))
+    : createUnassessedMarketplaceCompliance();
+  if (!shouldUseDatabaseStore()) {
+    for (const replayId of replayIds) {
+      const saved = memoryStore.getListing(replayId);
+      if (saved) {
+        if (saved.sellerId !== user.id) throw new Error('Draft operation ownership mismatch.');
+        return saved;
+      }
+    }
+    const listing = memoryStore.createListingDraft({
+      ...input,
+      id,
+      sellerId: user.id,
+    }, { compliance });
+    if (listing.compliance.modelAssessment) await recordModelReview({ subject: 'listing', subjectId: listing.id, listingId: listing.id, userId: user.id, text: listingSemanticText(listing), assessment: listing.compliance.modelAssessment });
+
+    safelyPublishRealtimeEvent({
+      type: 'ad_created',
+      payload: {
+        listingId: listing.id,
+        sellerId: listing.sellerId,
+        status: listing.status,
+      },
+      visibility: getListingRealtimeVisibility(listing.sellerId, listing.status),
+    });
+
+    return listing;
+  }
+
+  await ensureUser(user);
+
+  let listing: DatabaseListingRecord | null = null;
+
+  for (let attempt = 0; attempt < maxSerializableWriteAttempts; attempt += 1) {
+    try {
+      listing = await prisma.$transaction(
+        async (tx) => {
+          for (const replayId of replayIds) {
+            const saved = await tx.listing.findUnique({ where: { id: replayId }, include: { images: true } });
+            if (saved) {
+              if (saved.sellerId !== user.id) throw new Error('Draft operation ownership mismatch.');
+              return saved;
+            }
+          }
+          const sellerListingCount = await tx.listing.count({
+            where: {
+              sellerId: user.id,
+              status: { not: 'deleted' },
+            },
+          });
+
+          if (hasReachedSellerListingLimit(sellerListingCount)) {
+            throw new ListingLimitReachedError();
+          }
+
+          const created = await tx.listing.create({
+            data: {
+              id,
+              sellerId: user.id,
+              category: input.category,
+              title: input.title,
+              description: input.description,
+              price: toNumericPrice(input.price),
+              priceMode: toPriceMode(input.price),
+              city: input.city,
+              condition: input.condition,
+              attributes: toPrismaJsonObject(input.attributes ?? {}),
+              searchText: toNormalizedListingSearchText(input),
+              compliance: toPrismaJsonObject(
+                compliance as unknown as Record<string, unknown>,
+              ),
+              status: chooseInitialStatus(compliance),
+              firstPublicationTracked: true,
+            },
+            include: { images: true },
+          });
+          if (compliance.modelAssessment) await recordModelReview({ subject: 'listing', subjectId: created.id, listingId: created.id, userId: user.id, text: listingSemanticText({ ...input, attributes: input.attributes ?? {} }), assessment: compliance.modelAssessment }, tx);
+          return created;
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+      break;
+    } catch (error) {
+      if (
+        !(isPrismaKnownRequestError(error, 'P2034') || (options.idempotencyKey && isPrismaKnownRequestError(error, 'P2002'))) ||
+        attempt === maxSerializableWriteAttempts - 1
+      ) {
+        throw error;
+      }
+
+      await waitForSerializableRetry(attempt);
+    }
+  }
+
+  if (!listing) {
+    throw new Error('Listing draft transaction did not return a listing.');
+  }
+
+  const mappedListing = toListingRecord(listing);
+
+  safelyPublishRealtimeEvent({
+    type: 'ad_created',
+    payload: {
+      listingId: mappedListing.id,
+      sellerId: mappedListing.sellerId,
+      status: mappedListing.status,
+    },
+    visibility: getListingRealtimeVisibility(
+      mappedListing.sellerId,
+      mappedListing.status,
+    ),
+  });
+
+  return mappedListing;
+}
+
+async function lockSellerListingEvidenceEntities(
+  tx: Prisma.TransactionClient,
+  listingId: string,
+  sellerId: string,
+) {
+  // Evidence triggers acquire these keys on writes. Take the same ordered keys
+  // before a row lock so an account deletion cannot hold a key while waiting
+  // for this listing row, with its editor waiting for that key in the trigger.
+  for (const key of [`listing:${listingId}`, `user:${sellerId}`].sort()) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(771204, hashtext(${key}))`;
+  }
+}
+
+export async function updateListingForSeller(
+  listingId: string,
+  sellerId: string,
+  updates: UpdateListingInput,
+  options: { draftOnly?: boolean; modelReview?: boolean } = {},
+) {
+  // An omitted field preserves the saved value; explicit null clears an
+  // optional field. The file store represents cleared fields as undefined.
+  const { description, city, price, ...otherUpdates } = updates;
+  const normalizedUpdates: Partial<CreateListingInput> = { ...otherUpdates };
+  if ('description' in updates) normalizedUpdates.description = description ?? undefined;
+  if ('city' in updates) normalizedUpdates.city = city ?? undefined;
+  if ('price' in updates) normalizedUpdates.price = price ?? undefined;
+  const current = await getListing(listingId);
+  if (!current || current.sellerId !== sellerId || current.status === 'deleted' || (options.draftOnly && current.status !== 'draft')) return null;
+  mergeMarketplaceCategoryAttributes(updates.category ?? current.category, updates.attributes, current);
+  const assessmentText = listingSemanticText({ ...current, ...normalizedUpdates, attributes: { ...current.attributes, ...updates.attributes } });
+  if (options.modelReview) await marketplaceTextAnalyzer.analyze(assessmentText);
+  if (!shouldUseDatabaseStore()) {
+    if (options.draftOnly && memoryStore.getListing(listingId)?.status !== 'draft') return null;
+    const listing = memoryStore.updateListingForSeller(
+      listingId,
+      sellerId,
+      normalizedUpdates,
+      { compliance: options.modelReview
+        ? evaluateSaudiMarketplaceCompliance(listingSemanticText({ ...current, ...normalizedUpdates, attributes: mergeMarketplaceCategoryAttributes(updates.category ?? current.category, updates.attributes, current) }))
+        : createUnassessedMarketplaceCompliance() },
+    );
+
+    if (listing) {
+      if (listing.compliance.modelAssessment) await recordModelReview({ subject: 'listing', subjectId: listing.id, listingId: listing.id, userId: sellerId, text: listingSemanticText(listing), assessment: listing.compliance.modelAssessment });
+      safelyPublishRealtimeEvent({
+        type: 'ad_updated',
+        payload: {
+          listingId: listing.id,
+          sellerId: listing.sellerId,
+          status: listing.status,
+          reason: 'content',
+        },
+        visibility: getListingRealtimeVisibility(listing.sellerId, listing.status),
+      });
+    }
+
+    return listing;
+  }
+
+  const listing = await prisma.$transaction(async tx => {
+    // Serialize partial edits before reading the fields used to merge attributes
+    // and rebuild search text. A snapshot read outside this lock can overwrite
+    // another accepted edit even when the two requests change different fields.
+    await lockSellerListingEvidenceEntities(tx, listingId, sellerId);
+    await tx.$executeRaw`SELECT 1 FROM "Listing" WHERE id = ${listingId} FOR UPDATE`;
+    const record = await tx.listing.findUnique({
+      where: { id: listingId },
+      include: { images: true },
+    });
+    const existing = record ? toListingRecord(record) : null;
+    if (!existing || existing.sellerId !== sellerId || existing.status === 'deleted' ||
+        (options.draftOnly && existing.status !== 'draft')) return null;
+
+    const nextInput: CreateListingInput = {
+      category: updates.category ?? existing.category,
+      title: updates.title ?? existing.title,
+      description: 'description' in updates ? normalizedUpdates.description : existing.description,
+      price: 'price' in updates ? normalizedUpdates.price : existing.price,
+      city: 'city' in updates ? normalizedUpdates.city : existing.city,
+      condition: updates.condition ?? existing.condition,
+      attributes: mergeMarketplaceCategoryAttributes(updates.category ?? existing.category, updates.attributes, existing),
+    };
+    const assessedCompliance = options.modelReview
+      ? evaluateSaudiMarketplaceCompliance(listingSemanticText({ ...nextInput, attributes: nextInput.attributes ?? {} }))
+      : createUnassessedMarketplaceCompliance();
+    const compliance = existing.compliance.humanDecision === 'block'
+      ? { ...assessedCompliance, humanDecision: 'block' as const, decision: existing.compliance.decision }
+      : assessedCompliance;
+    const updated = await tx.listing.update({
+      where: { id: listingId, sellerId, ...(options.draftOnly ? { status: 'draft' } : { status: existing.status, compliance: { equals: toPrismaJsonObject(existing.compliance as unknown as Record<string, unknown>) } }) },
+      data: {
+        category: updates.category,
+        title: updates.title,
+        description: updates.description,
+        price:
+          'price' in updates ? toNumericPrice(normalizedUpdates.price) : undefined,
+        priceMode: 'price' in updates ? toPriceMode(normalizedUpdates.price) : undefined,
+        city: updates.city,
+        condition: updates.condition,
+        attributes: toPrismaJsonObject(nextInput.attributes ?? {}),
+        searchText: toNormalizedListingSearchText(nextInput),
+        compliance: toPrismaJsonObject(
+          compliance as unknown as Record<string, unknown>,
+        ),
+        status:
+          compliance.decision === 'block'
+            ? 'rejected'
+            : compliance.decision === 'needs_review'
+              ? 'pending'
+              : undefined,
+      },
+      include: { images: true },
+    });
+    if (compliance.modelAssessment) await recordModelReview({ subject: 'listing', subjectId: listingId, listingId, userId: sellerId, text: listingSemanticText({ ...nextInput, attributes: nextInput.attributes ?? {} }), assessment: compliance.modelAssessment }, tx);
+    return updated;
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted }).catch((error: unknown) => {
+    if (isPrismaKnownRequestError(error, 'P2025')) return null;
+    throw error;
+  });
+
+  if (!listing) return null;
+
+  const mappedListing = toListingRecord(listing);
+
+  safelyPublishRealtimeEvent({
+    type: 'ad_updated',
+    payload: {
+      listingId: mappedListing.id,
+      sellerId: mappedListing.sellerId,
+      status: mappedListing.status,
+      reason: 'content',
+    },
+    visibility: getListingRealtimeVisibility(
+      mappedListing.sellerId,
+      mappedListing.status,
+    ),
+  });
+
+  return mappedListing;
+}
+
+export async function setListingStatusForSeller(
+  listingId: string,
+  sellerId: string,
+  status: Extract<ListingStatus, 'published' | 'paused' | 'sold' | 'deleted'>,
+) {
+  if (!shouldUseDatabaseStore()) {
+    const existingListing = memoryStore.getListing(listingId);
+    if (!existingListing || existingListing.sellerId !== sellerId) return null;
+    if (status === 'published' && !existingListing.category.trim()) return existingListing;
+    const previousStatus = existingListing.status;
+    const listing = memoryStore.setListingStatusForSeller(
+      listingId,
+      sellerId,
+      status,
+    );
+
+    if (listing) {
+      safelyPublishRealtimeEvent({
+        type: 'ad_status_changed',
+        payload: {
+          listingId: listing.id,
+          sellerId: listing.sellerId,
+          previousStatus,
+          status: listing.status,
+        },
+        visibility: getListingRealtimeVisibility(listing.sellerId, listing.status),
+      });
+
+      await notifyPublishedListingBestEffort(listing, previousStatus);
+
+      if (listing.status === 'deleted') {
+        safelyPublishRealtimeEvent({
+          type: 'ad_deleted',
+          payload: {
+            listingId: listing.id,
+            sellerId: listing.sellerId,
+          },
+          visibility: {
+            includePublic: true,
+            includeAdmins: true,
+            userIds: [listing.sellerId],
+          },
+        });
+      }
+    }
+
+    return listing;
+  }
+
+  const existing = await getListing(listingId);
+
+  if (!existing || existing.sellerId !== sellerId) {
+    return null;
+  }
+
+  if (status === 'published' && (existing.compliance.humanDecision === 'block' || existing.status === 'deleted' || existing.status === 'rejected')) return existing;
+  if (existing.status === 'deleted' && status !== 'deleted') return null;
+  if (status === 'published' && !existing.category.trim()) return existing;
+  const nextStatus =
+    status === 'published' && existing.compliance.decision !== 'allow'
+      ? existing.compliance.decision === 'block'
+        ? 'rejected'
+        : 'pending'
+      : status;
+  const listing = await retryDirectImageTransaction(() => prisma.$transaction(async (tx) => {
+    await lockSellerListingEvidenceEntities(tx, listingId, sellerId);
+    if (directImageUploadsEnabled() && status === 'published' && await tx.listingImageUpload.count({
+      where: { listingId, status: { in: [...activeImageUploadStatuses] }, expiresAt: { gt: new Date() } },
+    })) throw new DirectImageUploadError('image_uploads_pending', 409);
+    await recordDatabaseFirstPublication(tx, listingId, nextStatus);
+    const updatedListing = await tx.listing.update({
+      where: { id: listingId, sellerId, status: existing.status, ...(status === 'published' ? { compliance: { equals: toPrismaJsonObject(existing.compliance as unknown as Record<string, unknown>) } } : {}) },
+      data: { status: nextStatus },
+      include: { images: true },
+    });
+
+    if (directImageUploadsEnabled() && status === 'deleted') {
+      await tx.listingImageUpload.updateMany({
+        where: { listingId, status: { in: [...activeImageUploadStatuses] } },
+        data: { status: 'cancelled', errorCode: 'listing_deleted', leaseToken: null, leaseUntil: null },
+      });
+    }
+
+    await ensureDatabaseSaleCommission(tx, updatedListing);
+    if (updatedListing.status === 'published' && existing.status !== 'published') {
+      await enqueueNotificationDelivery(tx, 'listing-published', updatedListing.id, { listingId: updatedListing.id });
+    }
+
+    return updatedListing;
+  }, directImageUploadsEnabled() ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable } : undefined)).catch((error: unknown) => {
+    if (isPrismaKnownRequestError(error, 'P2025')) return null;
+    throw error;
+  });
+  if (!listing) {
+    const current = status === 'published' ? await getListing(listingId) : null;
+    return current?.sellerId === sellerId && current.status === 'published' && current.compliance.humanDecision !== 'block'
+      ? current : null;
+  }
+
+  const mappedListing = toListingRecord(listing);
+  const previousStatus = existing.status;
+
+  safelyPublishRealtimeEvent({
+    type: 'ad_status_changed',
+    payload: {
+      listingId: mappedListing.id,
+      sellerId: mappedListing.sellerId,
+      previousStatus,
+      status: mappedListing.status,
+    },
+    visibility: getListingRealtimeVisibility(
+      mappedListing.sellerId,
+      mappedListing.status,
+    ),
+  });
+
+  await notifyPublishedListingBestEffort(mappedListing, previousStatus);
+
+  if (mappedListing.status === 'deleted') {
+    safelyPublishRealtimeEvent({
+      type: 'ad_deleted',
+      payload: {
+        listingId: mappedListing.id,
+        sellerId: mappedListing.sellerId,
+      },
+      visibility: {
+        includePublic: true,
+        includeAdmins: true,
+        userIds: [mappedListing.sellerId],
+      },
+    });
+  }
+
+  if (mappedListing.status === 'sold') {
+    const commission = await prisma.commission.findUnique({
+      where: { listingId: mappedListing.id },
+      select: {
+        id: true,
+        status: true,
+        sellerId: true,
+      },
+    });
+
+    if (commission) {
+      safelyPublishRealtimeEvent({
+        type: 'commission_updated',
+        payload: {
+          commissionId: commission.id,
+          listingId: mappedListing.id,
+          sellerId: commission.sellerId,
+          status: commission.status,
+          reason: 'created',
+        },
+        visibility: {
+          includeAdmins: true,
+          userIds: [commission.sellerId],
+        },
+      });
+    }
+  }
+
+  return mappedListing;
+}
+
+export async function addListingImageForSeller(
+  listingId: string,
+  sellerId: string,
+  image: ListingImage,
+  options: { draftOnly?: boolean } = {},
+) {
+  if (!shouldUseDatabaseStore()) {
+    if (options.draftOnly && memoryStore.getListing(listingId)?.status !== 'draft') return null;
+    const listing = memoryStore.addListingImageForSeller(
+      listingId,
+      sellerId,
+      image,
+    );
+
+    if (listing) {
+      safelyPublishRealtimeEvent({
+        type: 'ad_updated',
+        payload: {
+          listingId: listing.id,
+          sellerId: listing.sellerId,
+          status: listing.status,
+          reason: 'image_added',
+        },
+        visibility: getListingRealtimeVisibility(listing.sellerId, listing.status),
+      });
+    }
+
+    return listing;
+  }
+
+  let listing: DatabaseListingRecord | null = null;
+
+  for (let attempt = 0; attempt < maxSerializableWriteAttempts; attempt += 1) {
+    try {
+      listing = await prisma.$transaction(
+        async (tx) => {
+          await lockSellerListingEvidenceEntities(tx, listingId, sellerId);
+          await tx.$executeRaw`SELECT 1 FROM "Listing" WHERE id = ${listingId} FOR UPDATE`;
+          const existing = await tx.listing.findUnique({
+            where: { id: listingId },
+            include: { images: true },
+          });
+
+          if (!existing || existing.sellerId !== sellerId || existing.status === 'deleted' || (options.draftOnly && existing.status !== 'draft')) {
+            return null;
+          }
+
+          if (existing.images.some(saved => saved.id === image.id)) return existing;
+          if (hasReachedListingImageLimit(existing.images)) {
+            return existing;
+          }
+          if (directImageUploadsEnabled()) {
+            const reserved = await tx.listingImageUpload.count({
+              where: { listingId, status: { in: [...activeImageUploadStatuses] }, expiresAt: { gt: new Date() } },
+            });
+            if (existing.images.length + reserved >= getMaxListingImagesPerListing()) return existing;
+          }
+
+          const isFirstApprovedImage = !existing.images.some(
+            (currentImage) => currentImage.status === 'approved',
+          );
+
+          await sealPreparedListingImageDelivery(tx, image);
+          await tx.listingImage.create({
+            data: {
+              id: image.id,
+              listingId,
+              originalUrl: image.originalUrl,
+              displayUrl: image.displayUrl,
+              thumbnailUrl: image.thumbnailUrl,
+              isPrimary: image.isPrimary || isFirstApprovedImage,
+              qualityScore: image.qualityScore,
+              status: image.status,
+              enhancements: image.enhancements,
+              contentReviewStatus: image.contentReviewStatus,
+            },
+          });
+
+          return tx.listing.findUnique({
+            where: { id: listingId },
+            include: {
+              images: {
+                orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+              },
+            },
+          });
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+      break;
+    } catch (error) {
+      if (isPrismaKnownRequestError(error, 'P2002')) {
+        const saved = await getListing(listingId);
+        if (saved?.sellerId === sellerId && saved.images.some(current => current.id === image.id)) return saved;
+      }
+      if (
+        !isPrismaKnownRequestError(error, 'P2034') ||
+        attempt === maxSerializableWriteAttempts - 1
+      ) {
+        throw error;
+      }
+
+      await waitForSerializableRetry(attempt);
+    }
+  }
+
+  const mappedListing = listing ? toListingRecord(listing) : null;
+
+  if (mappedListing) {
+    scheduleListingEvidenceCopy(mappedListing.id);
+    safelyPublishRealtimeEvent({
+      type: 'ad_updated',
+      payload: {
+        listingId: mappedListing.id,
+        sellerId: mappedListing.sellerId,
+        status: mappedListing.status,
+        reason: 'image_added',
+      },
+      visibility: getListingRealtimeVisibility(
+        mappedListing.sellerId,
+        mappedListing.status,
+      ),
+    });
+  }
+
+  return mappedListing;
+}
+
+export async function deleteListingImageForSeller(
+  listingId: string,
+  sellerId: string,
+  imageId: string,
+) {
+  if (!shouldUseDatabaseStore()) {
+    const listing = memoryStore.deleteListingImageForSeller(
+      listingId,
+      sellerId,
+      imageId,
+    );
+
+    if (listing) {
+      safelyPublishRealtimeEvent({
+        type: 'ad_updated',
+        payload: {
+          listingId: listing.id,
+          sellerId: listing.sellerId,
+          status: listing.status,
+          reason: 'image_deleted',
+        },
+        visibility: getListingRealtimeVisibility(listing.sellerId, listing.status),
+      });
+    }
+
+    return listing;
+  }
+
+  const listing = await prisma.$transaction(async (tx) => {
+    await lockSellerListingEvidenceEntities(tx, listingId, sellerId);
+    await tx.$executeRaw`SELECT 1 FROM "Listing" WHERE id = ${listingId} FOR UPDATE`;
+    const existing = await tx.listing.findUnique({
+      where: { id: listingId },
+      include: { images: { orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }] } },
+    });
+    if (!existing || existing.sellerId !== sellerId) return null;
+    const imageToDelete = existing.images.find(image => image.id === imageId);
+    if (!imageToDelete) return null;
+
+    await enqueueImageObjectCleanup(tx, { imageId, preserveForRecovery: true, urls: [
+      imageToDelete.originalUrl, imageToDelete.displayUrl, imageToDelete.thumbnailUrl,
+    ] });
+    await tx.listingImage.delete({
+      where: { id: imageId },
+    });
+    if (directImageUploadsEnabled()) {
+      await tx.listingImageUpload.updateMany({ where: { id: imageId, listingId },
+        data: { status: 'cancelled', errorCode: 'image_deleted', leaseToken: null, leaseUntil: null } });
+    }
+
+    if (imageToDelete.isPrimary) {
+      const nextPrimaryImage = await tx.listingImage.findFirst({
+        where: {
+          listingId,
+          status: 'approved',
+        },
+        orderBy: { createdAt: 'asc' },
+      });
+
+      if (nextPrimaryImage) {
+        await tx.listingImage.updateMany({ where: { listingId, isPrimary: true }, data: { isPrimary: false } });
+        await tx.listingImage.update({
+          where: { id: nextPrimaryImage.id },
+          data: { isPrimary: true },
+        });
+      }
+    }
+
+    return tx.listing.update({
+      where: { id: listingId },
+      data: { updatedAt: new Date() },
+      include: {
+        images: {
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          take: getMaxListingImagesPerListing(),
+        },
+      },
+    });
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
+  if (!listing) return null;
+
+  try {
+    await processImageObjectCleanup(imageId);
+  } catch (error) {
+    const errorName = error instanceof Error ? error.name : 'UnknownError';
+    console.warn(`[listing_image_storage_delete] failure=${errorName}`);
+  }
+
+  const mappedListing = toListingRecord(listing);
+
+  safelyPublishRealtimeEvent({
+    type: 'ad_updated',
+    payload: {
+      listingId: mappedListing.id,
+      sellerId: mappedListing.sellerId,
+      status: mappedListing.status,
+      reason: 'image_deleted',
+    },
+    visibility: getListingRealtimeVisibility(
+      mappedListing.sellerId,
+      mappedListing.status,
+    ),
+  });
+
+  return mappedListing;
+}
+
+export async function setPrimaryListingImageForSeller(
+  listingId: string,
+  sellerId: string,
+  imageId: string,
+) {
+  if (!shouldUseDatabaseStore()) {
+    const listing = memoryStore.setPrimaryListingImageForSeller(
+      listingId,
+      sellerId,
+      imageId,
+    );
+
+    if (listing) {
+      safelyPublishRealtimeEvent({
+        type: 'ad_updated',
+        payload: {
+          listingId: listing.id,
+          sellerId: listing.sellerId,
+          status: listing.status,
+          reason: 'primary_image',
+        },
+        visibility: getListingRealtimeVisibility(listing.sellerId, listing.status),
+      });
+    }
+
+    return listing;
+  }
+
+  const listing = await prisma.$transaction(async (tx) => {
+    // Add, remove and choose-primary all serialize on this listing before
+    // reading image flags, including ownership changes during account deletion.
+    await lockSellerListingEvidenceEntities(tx, listingId, sellerId);
+    await tx.$executeRaw`SELECT 1 FROM "Listing" WHERE id = ${listingId} FOR UPDATE`;
+    const existing = await tx.listing.findUnique({ where: { id: listingId }, include: { images: true } });
+    if (!existing || existing.sellerId !== sellerId || !existing.images.some(image => image.id === imageId)) return null;
+    await tx.listingImage.updateMany({
+      where: { listingId },
+      data: { isPrimary: false },
+    });
+    await tx.listingImage.update({
+      where: { id: imageId },
+      data: { isPrimary: true },
+    });
+
+    return tx.listing.update({
+      where: { id: listingId },
+      data: { updatedAt: new Date() },
+      include: {
+        images: {
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          take: getMaxListingImagesPerListing(),
+        },
+      },
+    });
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
+  if (!listing) return null;
+
+  const mappedListing = toListingRecord(listing);
+
+  safelyPublishRealtimeEvent({
+    type: 'ad_updated',
+    payload: {
+      listingId: mappedListing.id,
+      sellerId: mappedListing.sellerId,
+      status: mappedListing.status,
+      reason: 'primary_image',
+    },
+    visibility: getListingRealtimeVisibility(
+      mappedListing.sellerId,
+      mappedListing.status,
+    ),
+  });
+
+  return mappedListing;
+}
+
+export async function listUserConversationsPage(
+  userId: string,
+  filters: PaginationInput = {},
+) {
+  const pagination = normalizePagination(filters, {
+    defaultLimit: 20,
+    maxLimit: 48,
+  });
+
+  if (!shouldUseDatabaseStore()) {
+    return toPaginatedResponse(
+      memoryStore
+        .listUserConversations(userId)
+        .slice(pagination.skip, pagination.skip + pagination.take),
+      pagination,
+    );
+  }
+
+  const conversations = await prisma.conversation.findMany({
+    where: {
+      OR: [{ buyerId: userId }, { sellerId: userId }],
+      NOT: {
+        messages: {
+          some: {
+            senderId: userId,
+            type: 'conversation_hidden',
+          },
+        },
+      },
+    },
+    include: {
+      messages: { orderBy: { createdAt: 'desc' }, take: 10 },
+      seller: {
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          picture: true,
+          lastActiveAt: true,
+          deletedAt: true,
+        },
+      },
+      buyer: {
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          picture: true,
+          lastActiveAt: true,
+          deletedAt: true,
+        },
+      },
+      listing: {
+        include: {
+          images: {
+            orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+            take: 4,
+          },
+        },
+      },
+    },
+    orderBy: { updatedAt: 'desc' },
+    skip: pagination.skip,
+    take: pagination.take,
+  });
+
+  return toPaginatedResponse(conversations.map(toConversationRecord), pagination);
+}
+
+export async function getConversationForUser(
+  conversationId: string,
+  userId: string,
+) {
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.getConversationForUser(conversationId, userId);
+  }
+
+  const conversation = await prisma.conversation.findFirst({
+    where: {
+      id: conversationId,
+      OR: [{ buyerId: userId }, { sellerId: userId }],
+    },
+    include: {
+      messages: { orderBy: { createdAt: 'asc' } },
+      seller: {
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          picture: true,
+          lastActiveAt: true,
+          deletedAt: true,
+        },
+      },
+      buyer: {
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          picture: true,
+          lastActiveAt: true,
+          deletedAt: true,
+        },
+      },
+      listing: {
+        include: {
+          images: {
+            orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          },
+        },
+      },
+    },
+  });
+
+  return conversation ? toConversationRecord(conversation) : null;
+}
+
+export async function deleteConversationForUser(
+  conversationId: string,
+  userId: string,
+) {
+  if (!shouldUseDatabaseStore()) {
+    const result = memoryStore.deleteConversationForUser(conversationId, userId);
+
+    if (result.status === 'deleted') {
+      safelyPublishRealtimeEvent({
+        type: 'conversation_updated',
+        payload: {
+          conversationId: result.conversation.id,
+          listingId: result.conversation.listingId,
+          sellerId: result.conversation.sellerId,
+          buyerId: result.conversation.buyerId,
+          status: 'hidden',
+        },
+        visibility: {
+          userIds: [userId],
+        },
+      });
+    }
+
+    return result;
+  }
+
+  const conversation = await prisma.conversation.findFirst({
+    where: {
+      id: conversationId,
+      OR: [{ buyerId: userId }, { sellerId: userId }],
+      NOT: {
+        messages: {
+          some: {
+            senderId: userId,
+            type: 'conversation_hidden',
+          },
+        },
+      },
+    },
+  });
+
+  if (!conversation) {
+    return { status: 'not_found' as const };
+  }
+
+  await prisma.conversationMessage.upsert({
+    where: {
+      id: `${conversation.id}:hidden:${userId}`,
+    },
+    create: {
+      id: `${conversation.id}:hidden:${userId}`,
+      conversationId: conversation.id,
+      senderId: userId,
+      body: 'conversation_hidden',
+      status: 'blocked',
+      type: 'conversation_hidden',
+      reasons: ['hidden_by_user'],
+      metadata: toPrismaJsonObject({ hiddenBy: userId }),
+    },
+    update: {
+      metadata: toPrismaJsonObject({ hiddenBy: userId }),
+    },
+  });
+
+  safelyPublishRealtimeEvent({
+    type: 'conversation_updated',
+    payload: {
+      conversationId: conversation.id,
+      listingId: conversation.listingId,
+      sellerId: conversation.sellerId,
+      buyerId: conversation.buyerId,
+      status: 'hidden',
+    },
+    visibility: {
+      userIds: [userId],
+    },
+  });
+
+  return { status: 'deleted' as const, conversation };
+}
+
+// Merge against the current locked PostgreSQL row rather than a metadata
+// snapshot read before concurrent delivery/read/delete operations completed.
+function mergeConversationMessageMetadata(
+  messageId: string,
+  userId: string,
+  field: 'readBy' | 'deliveredTo' | 'deletedFor' | 'deletedForEveryone',
+  value: Record<string, string>,
+  deleteEveryone = false,
+) {
+  return prisma.$executeRaw`
+    UPDATE "ConversationMessage" AS message
+    SET "metadata" =
+      (CASE WHEN jsonb_typeof(message."metadata") = 'object'
+        THEN message."metadata" ELSE '{}'::jsonb END)
+      - (CASE WHEN ${deleteEveryone} THEN ARRAY['phoneNumber'] ELSE ARRAY[]::text[] END)
+      || jsonb_build_object(${field}::text,
+        (CASE WHEN jsonb_typeof(message."metadata" -> ${field}::text) = 'object'
+          THEN message."metadata" -> ${field}::text ELSE '{}'::jsonb END)
+        || ${JSON.stringify(value)}::jsonb),
+      "body" = CASE WHEN ${deleteEveryone} THEN 'message_deleted' ELSE message."body" END,
+      "type" = CASE WHEN ${deleteEveryone} THEN 'message_deleted' ELSE message."type" END
+    FROM "Conversation" AS conversation
+    WHERE message."id" = ${messageId}
+      AND message."conversationId" = conversation."id"
+      AND (conversation."buyerId" = ${userId} OR conversation."sellerId" = ${userId})
+      AND message."status" = 'sent'
+      AND message."type" <> 'conversation_hidden'
+      AND (NOT ${deleteEveryone} OR message."senderId" = ${userId})
+  `;
+}
+
+export async function markConversationReadForUser(
+  conversationId: string,
+  userId: string,
+) {
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.markConversationReadForUser(conversationId, userId);
+  }
+
+  const conversation = await prisma.conversation.findFirst({
+    where: {
+      id: conversationId,
+      OR: [{ buyerId: userId }, { sellerId: userId }],
+    },
+    include: {
+      messages: {
+        where: {
+          status: 'sent',
+          senderId: { not: userId },
+        },
+      },
+    },
+  });
+
+  if (!conversation) {
+    return { status: 'not_found' as const };
+  }
+
+  const readAt = new Date().toISOString();
+  const updates = conversation.messages
+    .map((message) => {
+      const metadata = asRecord(message.metadata);
+      const readBy =
+        typeof metadata.readBy === 'object' &&
+        metadata.readBy !== null &&
+        !Array.isArray(metadata.readBy)
+          ? (metadata.readBy as Record<string, unknown>)
+          : {};
+
+      if (typeof readBy[userId] === 'string') {
+        return null;
+      }
+
+      return mergeConversationMessageMetadata(message.id, userId, 'readBy', {
+        [userId]: readAt,
+      });
+    })
+    .filter((update): update is NonNullable<typeof update> => Boolean(update));
+
+  if (updates.length > 0) {
+    await prisma.$transaction(updates);
+    safelyPublishRealtimeEvent({
+      type: 'conversation_updated',
+      payload: {
+        conversationId: conversation.id,
+        listingId: conversation.listingId,
+        sellerId: conversation.sellerId,
+        buyerId: conversation.buyerId,
+        status: conversation.status,
+      },
+      visibility: {
+        userIds: [conversation.sellerId, conversation.buyerId],
+      },
+    });
+  }
+
+  return { status: 'read' as const, conversation };
+}
+
+export async function markConversationsDeliveredForUser(
+  conversationIds: string[],
+  userId: string,
+) {
+  const uniqueConversationIds = [...new Set(conversationIds.filter(Boolean))];
+
+  if (uniqueConversationIds.length === 0) {
+    return { status: 'delivered' as const, updatedCount: 0 };
+  }
+
+  if (!shouldUseDatabaseStore()) {
+    return { status: 'delivered' as const, updatedCount: 0 };
+  }
+
+  const conversations = await prisma.conversation.findMany({
+    where: {
+      id: { in: uniqueConversationIds },
+      OR: [{ buyerId: userId }, { sellerId: userId }],
+    },
+    include: {
+      messages: {
+        where: {
+          status: 'sent',
+          senderId: { not: userId },
+        },
+      },
+    },
+  });
+
+  const deliveredAt = new Date().toISOString();
+  const updates = conversations.flatMap((conversation) =>
+    conversation.messages
+      .map((message) => {
+        const metadata = asRecord(message.metadata);
+        const deliveredTo =
+          typeof metadata.deliveredTo === 'object' &&
+          metadata.deliveredTo !== null &&
+          !Array.isArray(metadata.deliveredTo)
+            ? (metadata.deliveredTo as Record<string, unknown>)
+            : {};
+
+        if (typeof deliveredTo[userId] === 'string') {
+          return null;
+        }
+
+        return mergeConversationMessageMetadata(message.id, userId, 'deliveredTo', {
+          [userId]: deliveredAt,
+        });
+      })
+      .filter((update): update is NonNullable<typeof update> =>
+        Boolean(update),
+      ),
+  );
+
+  if (updates.length > 0) {
+    await prisma.$transaction(updates);
+
+    for (const conversation of conversations) {
+      safelyPublishRealtimeEvent({
+        type: 'conversation_updated',
+        payload: {
+          conversationId: conversation.id,
+          listingId: conversation.listingId,
+          sellerId: conversation.sellerId,
+          buyerId: conversation.buyerId,
+          status: conversation.status,
+        },
+        visibility: {
+          userIds: [conversation.sellerId, conversation.buyerId],
+        },
+      });
+    }
+  }
+
+  return { status: 'delivered' as const, updatedCount: updates.length };
+}
+
+export async function deleteConversationMessageForUser(
+  conversationId: string,
+  messageId: string,
+  userId: string,
+  mode: 'for_me' | 'for_everyone',
+) {
+  if (!shouldUseDatabaseStore()) {
+    const result = memoryStore.deleteConversationMessageForUser(
+      conversationId,
+      messageId,
+      userId,
+      mode,
+    );
+
+    if (result.conversation) {
+      safelyPublishRealtimeEvent({
+        type: 'conversation_updated',
+        payload: {
+          conversationId: result.conversation.id,
+          listingId: result.conversation.listingId,
+          sellerId: result.conversation.sellerId,
+          buyerId: result.conversation.buyerId,
+          status: result.conversation.status,
+        },
+        visibility: {
+          userIds: [result.conversation.sellerId, result.conversation.buyerId],
+        },
+      });
+    }
+
+    return result;
+  }
+
+  const message = await prisma.conversationMessage.findFirst({
+    where: {
+      id: messageId,
+      conversationId,
+      status: 'sent',
+      conversation: {
+        OR: [{ buyerId: userId }, { sellerId: userId }],
+      },
+      NOT: { type: 'conversation_hidden' },
+    },
+    include: {
+      conversation: true,
+    },
+  });
+
+  if (!message) {
+    return { status: 'not_found' as const };
+  }
+
+  if (mode === 'for_everyone' && message.senderId !== userId) {
+    return {
+      status: 'not_allowed' as const,
+      conversation: await getConversationForUser(conversationId, userId),
+    };
+  }
+
+  const deletedAt = new Date().toISOString();
+
+  if (mode === 'for_everyone') {
+    await mergeConversationMessageMetadata(message.id, userId, 'deletedForEveryone', {
+      by: userId,
+      at: deletedAt,
+    }, true);
+  } else {
+    await mergeConversationMessageMetadata(message.id, userId, 'deletedFor', {
+      [userId]: deletedAt,
+    });
+  }
+
+  await prisma.conversation.update({
+    where: { id: conversationId },
+    data: { updatedAt: new Date() },
+  });
+
+  const conversation = await getConversationForUser(conversationId, userId);
+
+  safelyPublishRealtimeEvent({
+    type: 'conversation_updated',
+    payload: {
+      conversationId: message.conversation.id,
+      listingId: message.conversation.listingId,
+      sellerId: message.conversation.sellerId,
+      buyerId: message.conversation.buyerId,
+      status: message.conversation.status,
+    },
+    visibility: {
+      userIds: [message.conversation.sellerId, message.conversation.buyerId],
+    },
+  });
+
+  return { status: 'deleted' as const, conversation };
+}
+
+function getOtherConversationUserId(conversation: Conversation, userId: string) {
+  if (conversation.buyerId === userId) {
+    return conversation.sellerId;
+  }
+
+  if (conversation.sellerId === userId) {
+    return conversation.buyerId;
+  }
+
+  return null;
+}
+
+async function lockConversationUserPair(
+  tx: Prisma.TransactionClient,
+  firstUserId: string,
+  secondUserId: string,
+) {
+  // Blocks apply to the pair across all of its conversations and in either
+  // direction. Hold this key through the block decision and message commit.
+  const pair = JSON.stringify([firstUserId, secondUserId].sort());
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(771207, hashtext(${pair}))`;
+}
+
+async function lockConversationParticipants(
+  tx: Prisma.TransactionClient,
+  conversation: { listingId: string; buyerId: string; sellerId: string },
+) {
+  await lockConversationUserPair(tx, conversation.buyerId, conversation.sellerId);
+  const keys = [`listing:${conversation.listingId}`, `user:${conversation.buyerId}`, `user:${conversation.sellerId}`];
+  for (const key of [...new Set(keys)].sort()) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(771204, hashtext(${key}))`;
+  }
+  // Keep an account active through the write, in the same advisory-before-row
+  // order used by account deletion and profile updates. Lock both rows in order.
+  await tx.$executeRaw`SELECT 1 FROM "User" WHERE id = ${conversation.buyerId} OR id = ${conversation.sellerId} ORDER BY id FOR SHARE`;
+}
+
+async function lockActiveConversationTarget(
+  tx: Prisma.TransactionClient,
+  target: { listingId: string; buyerId: string; sellerId: string },
+) {
+  await lockConversationParticipants(tx, target);
+  const current = await tx.listing.findFirst({
+    where: { id: target.listingId, sellerId: target.sellerId, status: 'published', seller: { deletedAt: null } },
+    select: { id: true },
+  });
+  return Boolean(current) && await tx.user.count({
+    where: { id: { in: [target.sellerId, target.buyerId] }, deletedAt: null },
+  }) === 2;
+}
+
+export async function getConversationBlockStatus(
+  conversationId: string,
+  userId: string,
+): Promise<ConversationBlockStatus | null> {
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.getConversationBlockStatus(conversationId, userId);
+  }
+
+  const conversation = await getConversationForUser(conversationId, userId);
+
+  if (!conversation) {
+    return null;
+  }
+
+  const otherUserId = getOtherConversationUserId(conversation, userId);
+
+  if (!otherUserId) {
+    return null;
+  }
+
+  const blocks = await prisma.userBlock.findMany({
+    where: {
+      OR: [
+        { blockerId: userId, blockedId: otherUserId },
+        { blockerId: otherUserId, blockedId: userId },
+      ],
+    },
+  });
+  // Both participants may block each other. The existence/order of the other
+  // participant's row must not hide this account's own unblock action.
+  const ownBlock = blocks.find(block => block.blockerId === userId);
+  const otherBlock = blocks.find(block => block.blockerId === otherUserId);
+  const block = ownBlock ?? otherBlock;
+  if (!block) {
+    return { blocked: false, blockedByMe: false };
+  }
+
+  return {
+    blocked: true,
+    blockedByMe: Boolean(ownBlock),
+    blockerId: block.blockerId,
+    blockedUserId: block.blockedId,
+  };
+}
+
+export async function createConversationForListing(
+  listingId: string,
+  buyer: Actor,
+) {
+  const buyerId = getActorId(buyer);
+
+  if (!shouldUseDatabaseStore()) {
+    const result = memoryStore.createConversationForListing(listingId, buyerId);
+
+    if (result.status === 'created' && result.conversation) {
+      safelyPublishRealtimeEvent({
+        type: 'conversation_updated',
+        payload: {
+          conversationId: result.conversation.id,
+          listingId: result.conversation.listingId,
+          sellerId: result.conversation.sellerId,
+          buyerId: result.conversation.buyerId,
+          status: result.conversation.status,
+        },
+        visibility: {
+          includeAdmins: true,
+          userIds: [result.conversation.sellerId, result.conversation.buyerId],
+        },
+      });
+
+      safelyPublishRealtimeEvent({
+        type: 'ad_updated',
+        payload: {
+          listingId: result.conversation.listingId,
+          sellerId: result.conversation.sellerId,
+          status: 'published',
+          reason: 'message_count',
+        },
+        visibility: {
+          includePublic: true,
+          includeAdmins: true,
+          userIds: [result.conversation.sellerId, result.conversation.buyerId],
+        },
+      });
+    }
+
+    return result;
+  }
+
+  const listing = await prisma.listing.findUnique({
+    where: { id: listingId, status: 'published', seller: { deletedAt: null } },
+    include: {
+      images: {
+        orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+      },
+    },
+  });
+
+  if (!listing || listing.status !== 'published') {
+    return {
+      status: 'not_found' as const,
+      conversation: null,
+    };
+  }
+
+  if (listing.sellerId === buyerId) {
+    return {
+      status: 'self_contact_blocked' as const,
+      conversation: null,
+    };
+  }
+
+  await ensureActorUser(buyer);
+
+  const existing = await prisma.conversation.findUnique({
+    where: {
+      listingId_sellerId_buyerId: {
+        listingId,
+        sellerId: listing.sellerId,
+        buyerId,
+      },
+    },
+    include: {
+      messages: { orderBy: { createdAt: 'asc' } },
+      listing: {
+        include: {
+          images: {
+            orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          },
+        },
+      },
+    },
+  });
+
+  if (existing) {
+    const allowed = await prisma.$transaction(tx =>
+      lockActiveConversationTarget(tx, { listingId, sellerId: listing.sellerId, buyerId }));
+    if (!allowed) return { status: 'not_found' as const, conversation: null };
+    return {
+      status: 'existing' as const,
+      conversation: toConversationRecord(existing),
+    };
+  }
+
+  let conversation: DatabaseConversationRecord | null;
+
+  try {
+    conversation = await prisma.$transaction(async (tx) => {
+      if (!await lockActiveConversationTarget(tx, { listingId, sellerId: listing.sellerId, buyerId })) return null;
+      const created = await tx.conversation.create({
+        data: {
+          listingId,
+          sellerId: listing.sellerId,
+          buyerId,
+        },
+        include: {
+          messages: { orderBy: { createdAt: 'asc' } },
+          listing: {
+            include: {
+              images: {
+                orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+              },
+            },
+          },
+        },
+      });
+
+      await tx.listing.update({
+        where: { id: listingId },
+        data: { messageCount: { increment: 1 } },
+      });
+
+      return created;
+    });
+  } catch (error) {
+    if (!isPrismaKnownRequestError(error, 'P2002')) {
+      throw error;
+    }
+
+    const racedConversation = await prisma.conversation.findUnique({
+      where: {
+        listingId_sellerId_buyerId: {
+          listingId,
+          sellerId: listing.sellerId,
+          buyerId,
+        },
+      },
+      include: {
+        messages: { orderBy: { createdAt: 'asc' } },
+        listing: {
+          include: {
+            images: {
+              orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+            },
+          },
+        },
+      },
+    });
+
+    if (!racedConversation) {
+      throw error;
+    }
+
+    const allowed = await prisma.$transaction(tx =>
+      lockActiveConversationTarget(tx, { listingId, sellerId: listing.sellerId, buyerId }));
+    if (!allowed) return { status: 'not_found' as const, conversation: null };
+
+    return {
+      status: 'existing' as const,
+      conversation: toConversationRecord(racedConversation),
+    };
+  }
+
+  if (!conversation) return { status: 'not_found' as const, conversation: null };
+
+  const mappedConversation = toConversationRecord(conversation);
+
+  safelyPublishRealtimeEvent({
+    type: 'conversation_updated',
+    payload: {
+      conversationId: mappedConversation.id,
+      listingId: mappedConversation.listingId,
+      sellerId: mappedConversation.sellerId,
+      buyerId: mappedConversation.buyerId,
+      status: mappedConversation.status,
+    },
+    visibility: {
+      includeAdmins: true,
+      userIds: [mappedConversation.sellerId, mappedConversation.buyerId],
+    },
+  });
+
+  safelyPublishRealtimeEvent({
+    type: 'ad_updated',
+    payload: {
+      listingId: mappedConversation.listingId,
+      sellerId: mappedConversation.sellerId,
+      status: mappedConversation.listing?.status ?? 'published',
+      reason: 'message_count',
+    },
+    visibility: {
+      includePublic: true,
+      includeAdmins: true,
+      userIds: [mappedConversation.sellerId, mappedConversation.buyerId],
+    },
+  });
+
+  return {
+    status: 'created' as const,
+    conversation: mappedConversation,
+  };
+}
+
+export async function reportConversationUser(
+  conversationId: string,
+  reporter: Actor,
+  input: { reason: string; details?: string },
+) {
+  const reporterId = getActorId(reporter);
+
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.reportConversationUser(conversationId, reporterId, input);
+  }
+
+  const conversation = await getConversationForUser(conversationId, reporterId);
+
+  if (!conversation) {
+    return {
+      status: 'not_found' as const,
+      report: null,
+      conversation: null,
+    };
+    }
+
+  const targetUserId = getOtherConversationUserId(conversation, reporterId);
+
+  if (!targetUserId) {
+    return {
+      status: 'not_found' as const,
+      report: null,
+      conversation: null,
+    };
+  }
+
+  const existingOpenReport = await prisma.userReport.findFirst({
+    where: {
+      reporterId,
+      targetUserId,
+      conversationId,
+      status: 'open',
+    },
+  });
+
+  if (existingOpenReport) {
+    return {
+      status: 'already_reported' as const,
+      report: {
+        id: existingOpenReport.id,
+        reporterId: existingOpenReport.reporterId,
+        targetUserId: existingOpenReport.targetUserId,
+        conversationId: existingOpenReport.conversationId ?? undefined,
+        reason: existingOpenReport.reason,
+        details: existingOpenReport.details ?? undefined,
+        status: existingOpenReport.status,
+        createdAt: existingOpenReport.createdAt.toISOString(),
+        updatedAt: existingOpenReport.updatedAt.toISOString(),
+      },
+      conversation,
+    };
+  }
+
+  await ensureActorUser(reporter);
+
+  const report = await prisma.$transaction(async tx => {
+    const created = await tx.userReport.create({
+      data: {
+        reporterId,
+        targetUserId,
+        conversationId,
+        reason: input.reason,
+        details: input.details,
+        status: 'open',
+      },
+    });
+    await tx.evidenceCase.findUniqueOrThrow({ where: { sourceType_sourceId: { sourceType: 'UserReport', sourceId: created.id } } });
+    return created;
+  })
+    .catch(async (error) => {
+      if (
+        !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+        error.code !== 'P2002'
+      ) {
+        throw error;
+      }
+
+      return prisma.userReport.findFirstOrThrow({
+        where: {
+          reporterId,
+          targetUserId,
+          conversationId,
+          status: 'open',
+        },
+      });
+    });
+
+  scheduleEvidenceCopy('UserReport', report.id);
+
+  safelyPublishRealtimeEvent({
+    type: 'conversation_updated',
+    payload: {
+      conversationId: conversation.id,
+      listingId: conversation.listingId,
+      sellerId: conversation.sellerId,
+      buyerId: conversation.buyerId,
+      status: conversation.status,
+    },
+    visibility: {
+      includeAdmins: true,
+      userIds: [conversation.sellerId, conversation.buyerId],
+    },
+  });
+
+  return {
+    status: 'reported' as const,
+    report: {
+      id: report.id,
+      reporterId: report.reporterId,
+      targetUserId: report.targetUserId,
+      conversationId: report.conversationId ?? undefined,
+      reason: report.reason,
+      details: report.details ?? undefined,
+      status: report.status,
+      createdAt: report.createdAt.toISOString(),
+      updatedAt: report.updatedAt.toISOString(),
+    },
+    conversation,
+  };
+}
+
+export async function blockConversationUser(
+  conversationId: string,
+  blocker: Actor,
+  reason?: string,
+) {
+  const blockerId = getActorId(blocker);
+
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.blockConversationUser(conversationId, blockerId, reason);
+  }
+
+  const conversation = await getConversationForUser(conversationId, blockerId);
+
+  if (!conversation) {
+    return {
+      status: 'not_found' as const,
+      block: null,
+      conversation: null,
+    };
+  }
+
+  const blockedId = getOtherConversationUserId(conversation, blockerId);
+
+  if (!blockedId) {
+    return {
+      status: 'not_found' as const,
+      block: null,
+      conversation: null,
+    };
+  }
+
+  await ensureActorUser(blocker);
+
+  const block = await prisma.$transaction(async tx => {
+    await lockConversationUserPair(tx, blockerId, blockedId);
+    const current = await tx.conversation.findFirst({
+      where: { id: conversationId, buyerId: conversation.buyerId, sellerId: conversation.sellerId,
+        buyer: { deletedAt: null }, seller: { deletedAt: null } },
+      select: { id: true },
+    });
+    if (!current) return null;
+    const existing = await tx.userBlock.findUnique({
+      where: { blockerId_blockedId: { blockerId, blockedId } },
+    });
+    // A customer-owned block must not replace a human moderation restriction.
+    if (existing?.reason === 'admin_moderation') return existing;
+    return tx.userBlock.upsert({
+    where: {
+      blockerId_blockedId: {
+        blockerId,
+        blockedId,
+      },
+    },
+    create: {
+      blockerId,
+      blockedId,
+      conversationId,
+      reason,
+    },
+    update: {
+      conversationId,
+      reason,
+    },
+    });
+  });
+
+  if (!block) return { status: 'not_found' as const, block: null, conversation: null };
+
+  safelyPublishRealtimeEvent({
+    type: 'conversation_updated',
+    payload: {
+      conversationId: conversation.id,
+      listingId: conversation.listingId,
+      sellerId: conversation.sellerId,
+      buyerId: conversation.buyerId,
+      status: conversation.status,
+    },
+    visibility: {
+      includeAdmins: true,
+      userIds: [conversation.sellerId, conversation.buyerId],
+    },
+  });
+
+  return {
+    status: 'blocked' as const,
+    block: {
+      id: block.id,
+      blockerId: block.blockerId,
+      blockedId: block.blockedId,
+      conversationId: block.conversationId ?? undefined,
+      reason: block.reason ?? undefined,
+      createdAt: block.createdAt.toISOString(),
+    },
+    conversation,
+  };
+}
+
+export async function unblockConversationUser(
+  conversationId: string,
+  blocker: Actor,
+) {
+  const blockerId = getActorId(blocker);
+
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.unblockConversationUser(conversationId, blockerId);
+  }
+
+  const conversation = await getConversationForUser(conversationId, blockerId);
+
+  if (!conversation) {
+    return {
+      status: 'not_found' as const,
+      block: null,
+      conversation: null,
+      blockStatus: null,
+    };
+  }
+
+  const blockedId = getOtherConversationUserId(conversation, blockerId);
+
+  if (!blockedId) {
+    return {
+      status: 'not_found' as const,
+      block: null,
+      conversation: null,
+      blockStatus: null,
+    };
+  }
+
+  const outcome = await prisma.$transaction(async tx => {
+    await lockConversationUserPair(tx, blockerId, blockedId);
+    const existing = await tx.userBlock.findUnique({
+    where: {
+      blockerId_blockedId: {
+        blockerId,
+        blockedId,
+      },
+    },
+    });
+    if (!existing) return { status: 'not_blocked' as const };
+    if (existing.reason === 'admin_moderation') return { status: 'conversation_blocked' as const };
+    await tx.userBlock.delete({ where: { blockerId_blockedId: { blockerId, blockedId } } });
+    return { status: 'unblocked' as const, block: existing };
+  });
+
+  if (outcome.status !== 'unblocked') {
+    return {
+      status: outcome.status,
+      block: null,
+      conversation,
+      blockStatus: await getConversationBlockStatus(conversationId, blockerId),
+    };
+  }
+  const existingBlock = outcome.block;
+
+  safelyPublishRealtimeEvent({
+    type: 'conversation_updated',
+    payload: {
+      conversationId: conversation.id,
+      listingId: conversation.listingId,
+      sellerId: conversation.sellerId,
+      buyerId: conversation.buyerId,
+      status: conversation.status,
+    },
+    visibility: {
+      includeAdmins: true,
+      userIds: [conversation.sellerId, conversation.buyerId],
+    },
+  });
+
+  return {
+    status: 'unblocked' as const,
+    block: {
+      id: existingBlock.id,
+      blockerId: existingBlock.blockerId,
+      blockedId: existingBlock.blockedId,
+      conversationId: existingBlock.conversationId ?? undefined,
+      reason: existingBlock.reason ?? undefined,
+      createdAt: existingBlock.createdAt.toISOString(),
+    },
+    conversation,
+    blockStatus: await getConversationBlockStatus(conversationId, blockerId),
+  };
+}
+
+export async function addConversationMessage(
+  conversationId: string,
+  sender: Actor,
+  body: string,
+  options: { operationKey?: string } = {},
+) {
+  const senderId = getActorId(sender);
+  // Keep the operation identity on the source row, independently of the
+  // short-lived HTTP receipt. Scope it again here for internal callers.
+  const messageId = options.operationKey ? `message-${createHash('sha256')
+    .update(JSON.stringify(['conversation-message-v1', conversationId, senderId, options.operationKey]))
+    .digest('hex')}` : undefined;
+
+  if (!shouldUseDatabaseStore()) {
+    const result = memoryStore.addConversationMessage(
+      conversationId,
+      senderId,
+      body,
+      messageId,
+    );
+
+    if ('replayed' in result) return result;
+    if (result.conversation && result.message) {
+      safelyPublishRealtimeEvent({
+        type: 'message_created',
+        payload: {
+          conversationId: result.conversation.id,
+          listingId: result.conversation.listingId,
+          sellerId: result.conversation.sellerId,
+          buyerId: result.conversation.buyerId,
+          messageId: result.message.id,
+          senderId: result.message.senderId,
+          status: result.message.status,
+        },
+        visibility: {
+          includeAdmins: true,
+          userIds: [result.conversation.sellerId, result.conversation.buyerId],
+        },
+      });
+
+      safelyPublishRealtimeEvent({
+        type: 'conversation_updated',
+        payload: {
+          conversationId: result.conversation.id,
+          listingId: result.conversation.listingId,
+          sellerId: result.conversation.sellerId,
+          buyerId: result.conversation.buyerId,
+          status: result.conversation.status,
+        },
+        visibility: {
+          includeAdmins: true,
+          userIds: [result.conversation.sellerId, result.conversation.buyerId],
+        },
+      });
+    }
+
+    return result;
+  }
+
+  const conversation = await getConversationForUser(conversationId, senderId);
+
+  if (!conversation) {
+    return {
+      status: 'not_found' as const,
+      message: null,
+      conversation: null,
+    };
+  }
+
+  if (conversation.status !== 'open') {
+    return {
+      status: 'conversation_closed' as const,
+      message: null,
+      conversation,
+    };
+  }
+
+  const blockStatus = await getConversationBlockStatus(conversationId, senderId);
+
+  if (blockStatus?.blocked) {
+    return {
+      status: 'conversation_blocked' as const,
+      message: null,
+      conversation,
+      blockStatus,
+    };
+  }
+
+  await ensureActorUser(sender);
+
+  const trimmedBody = body.trim();
+  const safety = evaluateConversationMessageSafety(trimmedBody);
+
+  if (safety.decision !== 'allow') {
+    return {
+      status: 'message_blocked' as const,
+      message: null,
+      conversation,
+      reasons: safety.reasons,
+    };
+  }
+
+  const delivery = await prisma.$transaction(async tx => {
+    await lockConversationUserPair(tx, conversation.buyerId, conversation.sellerId);
+    const current = await tx.conversation.findFirst({
+      where: { id: conversationId, buyerId: conversation.buyerId, sellerId: conversation.sellerId,
+        buyer: { deletedAt: null }, seller: { deletedAt: null } },
+      select: { id: true, status: true, listingId: true },
+    });
+    if (!current) return { status: 'not_found' as const };
+    if (current.status !== 'open') return { status: 'conversation_closed' as const };
+    if (messageId) {
+      const existing = await tx.conversationMessage.findUnique({ where: { id: messageId } });
+      if (existing) {
+        if (existing.conversationId !== conversationId || existing.senderId !== senderId) {
+          throw new Error('message_operation_ownership_mismatch');
+        }
+        return { status: 'sent' as const, message: existing, replayed: true as const };
+      }
+    }
+    const block = await tx.userBlock.findFirst({ where: { OR: [
+      { blockerId: conversation.buyerId, blockedId: conversation.sellerId },
+      { blockerId: conversation.sellerId, blockedId: conversation.buyerId },
+    ] } });
+    if (block) return { status: 'conversation_blocked' as const, blockStatus: {
+      blocked: true as const, blockedByMe: block.blockerId === senderId,
+      blockerId: block.blockerId, blockedUserId: block.blockedId,
+    } };
+
+    // Acquire the evidence key before the conversation row is written, in the
+    // same order as the existing delete/capture flows. The guarded update also
+    // detects a close/account deletion committed while this transaction waited.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(771204, hashtext(${'listing:' + current.listingId}))`;
+    const updated = await tx.conversation.updateMany({
+      where: { id: conversationId, status: 'open', buyer: { deletedAt: null }, seller: { deletedAt: null } },
+      data: { updatedAt: new Date() },
+    });
+    if (!updated.count) return { status: 'conversation_closed' as const };
+    const created = await tx.conversationMessage.create({ data: {
+      ...(messageId ? { id: messageId } : {}),
+      conversationId, senderId, body: trimmedBody, status: 'sent', type: 'text',
+      reasons: safety.reasons, metadata: toPrismaJsonObject({}),
+    } });
+    await enqueueNotificationDelivery(tx, 'conversation-message', created.id, { messageId: created.id });
+    return { status: 'sent' as const, message: created };
+  });
+  if (delivery.status !== 'sent') return {
+    status: delivery.status, message: null, conversation,
+    ...(delivery.status === 'conversation_blocked' ? { blockStatus: delivery.blockStatus } : {}),
+  };
+  const message = delivery.message;
+  if (!('replayed' in delivery)) scheduleNotificationDelivery(true);
+
+  const updatedConversation = await getConversationForUser(
+    conversationId,
+    senderId,
+  );
+  const mappedMessage: ConversationMessage = {
+    id: message.id,
+    conversationId: message.conversationId,
+    senderId: message.senderId,
+    body: message.body,
+    status: message.status as ConversationMessage['status'],
+    type: message.type === 'contact_share' ? 'contact_share'
+      : message.type === 'message_deleted' ? 'message_deleted' : 'text',
+    reasons: message.reasons,
+    metadata: conversationMessageMetadata(message),
+    createdAt: message.createdAt.toISOString(),
+  };
+
+  if ('replayed' in delivery) return {
+    status: 'sent' as const, message: mappedMessage, conversation: updatedConversation,
+    replayed: true as const,
+  };
+
+  if (updatedConversation) {
+    safelyPublishRealtimeEvent({
+      type: 'message_created',
+      payload: {
+        conversationId: updatedConversation.id,
+        listingId: updatedConversation.listingId,
+        sellerId: updatedConversation.sellerId,
+        buyerId: updatedConversation.buyerId,
+        messageId: mappedMessage.id,
+        senderId: mappedMessage.senderId,
+        status: mappedMessage.status,
+      },
+      visibility: {
+        includeAdmins: true,
+        userIds: [updatedConversation.sellerId, updatedConversation.buyerId],
+      },
+    });
+
+    safelyPublishRealtimeEvent({
+      type: 'conversation_updated',
+      payload: {
+        conversationId: updatedConversation.id,
+        listingId: updatedConversation.listingId,
+        sellerId: updatedConversation.sellerId,
+        buyerId: updatedConversation.buyerId,
+        status: updatedConversation.status,
+      },
+      visibility: {
+        includeAdmins: true,
+        userIds: [updatedConversation.sellerId, updatedConversation.buyerId],
+      },
+    });
+  }
+
+  return {
+    status: 'sent' as const,
+    message: mappedMessage,
+    conversation: updatedConversation,
+  };
+}
+
+export async function shareSellerContact(conversationId: string, actor: Actor) {
+  const actorId = getActorId(actor);
+
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.shareSellerContact(
+      conversationId,
+      actorId,
+      typeof actor === 'string' ? null : actor.phoneNumber,
+    );
+  }
+
+  const conversation = await getConversationForUser(conversationId, actorId);
+
+  if (!conversation) {
+    return {
+      status: 'not_found' as const,
+      message: null,
+      conversation: null,
+    };
+  }
+
+  if (conversation.status !== 'open') {
+    return {
+      status: 'conversation_closed' as const,
+      message: null,
+      conversation,
+    };
+  }
+
+  const blockStatus = await getConversationBlockStatus(conversationId, actorId);
+
+  if (blockStatus?.blocked) {
+    return {
+      status: 'conversation_blocked' as const,
+      message: null,
+      conversation,
+      blockStatus,
+    };
+  }
+
+  const sharing = await prisma.$transaction(async tx => {
+    await lockConversationParticipants(tx, conversation);
+    const current = await tx.conversation.findFirst({
+      where: { id: conversationId, buyerId: conversation.buyerId, sellerId: conversation.sellerId,
+        buyer: { deletedAt: null }, seller: { deletedAt: null } },
+      select: { id: true, status: true },
+    });
+    if (!current) return { status: 'not_found' as const };
+    if (current.status !== 'open') return { status: 'conversation_closed' as const };
+    const block = await tx.userBlock.findFirst({ where: { OR: [
+      { blockerId: conversation.buyerId, blockedId: conversation.sellerId },
+      { blockerId: conversation.sellerId, blockedId: conversation.buyerId },
+    ] } });
+    if (block) return { status: 'conversation_blocked' as const, blockStatus: {
+      blocked: true, blockedByMe: block.blockerId === actorId,
+      blockerId: block.blockerId, blockedUserId: block.blockedId,
+    } };
+    const profile = await tx.user.findUnique({ where: { id: actorId }, select: { phoneNumber: true } });
+    if (!profile?.phoneNumber) return { status: 'missing_phone' as const };
+    const updated = await tx.conversation.updateMany({
+      where: { id: conversationId, status: 'open', buyer: { deletedAt: null }, seller: { deletedAt: null } },
+      data: { updatedAt: new Date() },
+    });
+    if (!updated.count) return { status: 'conversation_closed' as const };
+    const message = await tx.conversationMessage.create({ data: {
+      conversationId, senderId: actorId, body: 'official_contact_share', status: 'sent',
+      type: 'contact_share', reasons: ['official_contact_share'],
+      metadata: toPrismaJsonObject({ phoneNumber: profile.phoneNumber }),
+    } });
+    return { status: 'shared' as const, message };
+  });
+  if (sharing.status !== 'shared') return {
+    ...sharing, message: null, conversation: sharing.status === 'not_found' ? null : conversation,
+  };
+  const message = sharing.message;
+
+  const updatedConversation = await getConversationForUser(
+    conversationId,
+    actorId,
+  );
+  const mappedMessage: ConversationMessage = {
+    id: message.id,
+    conversationId: message.conversationId,
+    senderId: message.senderId,
+    body: message.body,
+    status: 'sent',
+    type: 'contact_share',
+    reasons: message.reasons,
+    metadata: asRecord(message.metadata),
+    createdAt: message.createdAt.toISOString(),
+  };
+
+  if (updatedConversation) {
+    safelyPublishRealtimeEvent({
+      type: 'message_created',
+      payload: {
+        conversationId: updatedConversation.id,
+        listingId: updatedConversation.listingId,
+        sellerId: updatedConversation.sellerId,
+        buyerId: updatedConversation.buyerId,
+        messageId: mappedMessage.id,
+        senderId: mappedMessage.senderId,
+        status: mappedMessage.status,
+      },
+      visibility: {
+        includeAdmins: true,
+        userIds: [updatedConversation.sellerId, updatedConversation.buyerId],
+      },
+    });
+
+    safelyPublishRealtimeEvent({
+      type: 'conversation_updated',
+      payload: {
+        conversationId: updatedConversation.id,
+        listingId: updatedConversation.listingId,
+        sellerId: updatedConversation.sellerId,
+        buyerId: updatedConversation.buyerId,
+        status: updatedConversation.status,
+      },
+      visibility: {
+        includeAdmins: true,
+        userIds: [updatedConversation.sellerId, updatedConversation.buyerId],
+      },
+    });
+  }
+
+  return {
+    status: 'shared' as const,
+    message: mappedMessage,
+    conversation: updatedConversation,
+  };
+}
+
+export async function listUserFavoritesPage(
+  userId: string,
+  filters: PaginationInput = {},
+) {
+  const pagination = normalizePagination(filters, {
+    defaultLimit: 24,
+    maxLimit: 48,
+  });
+
+  if (!shouldUseDatabaseStore()) {
+    return toPaginatedResponse(
+      memoryStore
+        .listUserFavorites(userId)
+        .filter((favorite) => favorite.listing?.status === 'published')
+        .slice(pagination.skip, pagination.skip + pagination.take),
+      pagination,
+    );
+  }
+
+  const favorites = await prisma.favorite.findMany({
+    where: activePublishedFavoriteWhere(userId),
+    include: {
+      listing: {
+        include: {
+          images: {
+            orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+            take: 4,
+          },
+        },
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+    skip: pagination.skip,
+    take: pagination.take,
+  });
+
+  return toPaginatedResponse(favorites.map(toFavoriteRecord), pagination);
+}
+
+export async function getListingFavoriteState(listingId: string, actor: Actor) {
+  const userId = getActorId(actor);
+
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.getListingFavoriteState(listingId, userId);
+  }
+
+  const listing = await getListing(listingId);
+
+  if (!listing || listing.status !== 'published') {
+    return {
+      status: 'not_found' as const,
+      isFavorite: false,
+      canFavorite: false,
+      listing: null,
+    };
+  }
+
+  if (listing.sellerId === userId) {
+    return {
+      status: 'ok' as const,
+      isFavorite: false,
+      canFavorite: false,
+      listing,
+    };
+  }
+
+  const favorite = await prisma.favorite.findUnique({
+    where: {
+      listingId_userId: {
+        listingId,
+        userId,
+      },
+    },
+    select: { id: true },
+  });
+
+  return {
+    status: 'ok' as const,
+    isFavorite: Boolean(favorite),
+    canFavorite: true,
+    listing,
+  };
+}
+
+export async function toggleFavoriteListing(listingId: string, actor: Actor) {
+  const userId = getActorId(actor);
+
+  if (!shouldUseDatabaseStore()) {
+    const result = memoryStore.toggleFavoriteListing(listingId, userId);
+
+    if (result.listing) {
+      safelyPublishRealtimeEvent({
+        type: 'ad_updated',
+        payload: {
+          listingId: result.listing.id,
+          sellerId: result.listing.sellerId,
+          status: result.listing.status,
+          reason: 'favorite_count',
+        },
+        visibility: {
+          includePublic: true,
+          includeAdmins: true,
+          userIds: [userId, result.listing.sellerId],
+        },
+      });
+    }
+
+    return result;
+  }
+
+  const listing = await getListing(listingId);
+
+  if (!listing || listing.status !== 'published') {
+    return {
+      status: 'not_found' as const,
+      favorite: null,
+      listing: null,
+    };
+  }
+
+  if (listing.sellerId === userId) {
+    return {
+      status: 'self_favorite_blocked' as const,
+      favorite: null,
+      listing,
+    };
+  }
+
+  await ensureActorUser(actor);
+
+  let result:
+    | {
+        status: 'saved';
+        favorite: FavoriteRecord;
+        listing: memoryStore.ListingRecord;
+      }
+    | {
+        status: 'removed';
+        favorite: null;
+        listing: memoryStore.ListingRecord;
+      }
+    | null = null;
+
+  for (let attempt = 0; attempt < maxSerializableWriteAttempts; attempt += 1) {
+    try {
+      result = await prisma.$transaction(
+        async (tx) => {
+          const existingFavorite = await tx.favorite.findUnique({
+            where: {
+              listingId_userId: {
+                listingId,
+                userId,
+              },
+            },
+          });
+          let favorite: FavoriteRecord | null = null;
+          let status: 'saved' | 'removed';
+
+          if (existingFavorite) {
+            await tx.favorite.delete({
+              where: {
+                listingId_userId: {
+                  listingId,
+                  userId,
+                },
+              },
+            });
+            status = 'removed';
+          } else {
+            const createdFavorite = await tx.favorite.create({
+              data: {
+                listingId,
+                userId,
+              },
+            });
+            favorite = {
+              id: createdFavorite.id,
+              listingId: createdFavorite.listingId,
+              userId: createdFavorite.userId,
+              createdAt: createdFavorite.createdAt.toISOString(),
+            };
+            status = 'saved';
+          }
+
+          const favoriteCount = await tx.favorite.count({
+            where: { listingId },
+          });
+          const updatedListing = await tx.listing.update({
+            where: { id: listingId },
+            data: { favoriteCount },
+            include: {
+              images: {
+                orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+              },
+            },
+          });
+
+          return {
+            status,
+            favorite,
+            listing: toListingRecord(updatedListing),
+          } as
+            | {
+                status: 'saved';
+                favorite: FavoriteRecord;
+                listing: memoryStore.ListingRecord;
+              }
+            | {
+                status: 'removed';
+                favorite: null;
+                listing: memoryStore.ListingRecord;
+              };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+      break;
+    } catch (error) {
+      if (
+        !isRetryablePrismaWriteConflict(error) ||
+        attempt === maxSerializableWriteAttempts - 1
+      ) {
+        throw error;
+      }
+
+      await waitForSerializableRetry(attempt);
+    }
+  }
+
+  if (!result) {
+    throw new Error('Favorite toggle transaction did not return a result.');
+  }
+
+  safelyPublishRealtimeEvent({
+    type: 'ad_updated',
+    payload: {
+      listingId: result.listing.id,
+      sellerId: result.listing.sellerId,
+      status: result.listing.status,
+      reason: 'favorite_count',
+    },
+    visibility: {
+      includePublic: true,
+      includeAdmins: true,
+      userIds: [userId, result.listing.sellerId],
+    },
+  });
+
+  return result;
+}
+
+export async function hasReportedListing(listingId: string, actor: Actor) {
+  const reporterId = getActorId(actor);
+  if (!shouldUseDatabaseStore()) {
+    return Boolean(memoryStore.getListingReport(listingId, reporterId));
+  }
+  return Boolean(await prisma.report.findFirst({
+    where: { listingId, reporterId },
+    select: { id: true },
+  }));
+}
+
+export async function reportListing(
+  listingId: string,
+  actor: Actor,
+  reason: string,
+  details?: string,
+) {
+  const reporterId = getActorId(actor);
+
+  if (!shouldUseDatabaseStore()) {
+    const result = memoryStore.reportListing(listingId, reporterId, reason, details);
+
+    if (result.listing && !result.alreadyReported) {
+      safelyPublishRealtimeEvent({
+        type: 'ad_updated',
+        payload: {
+          listingId: result.listing.id,
+          sellerId: result.listing.sellerId,
+          status: result.listing.status,
+          reason: 'report',
+        },
+        visibility: {
+          includeAdmins: true,
+          userIds: [result.listing.sellerId],
+        },
+      });
+    }
+
+    return result;
+  }
+
+  const listing = await getListing(listingId);
+
+  if (!listing || listing.status !== 'published') {
+    return {
+      status: 'not_found' as const,
+      report: null,
+      listing: null,
+    };
+  }
+
+  await ensureActorUser(actor);
+
+  let result: { report: Prisma.ReportGetPayload<object>; alreadyReported: boolean } | null = null;
+  for (let attempt = 0; attempt < maxSerializableWriteAttempts; attempt += 1) {
+    try {
+      result = await prisma.$transaction(async (tx) => {
+        const existingReport = await tx.report.findFirst({
+          where: { listingId, reporterId },
+          orderBy: { createdAt: 'asc' },
+        });
+        if (existingReport) return { report: existingReport, alreadyReported: true };
+        const report = await tx.report.create({
+          data: { listingId, reporterId, reason, details },
+        });
+        await tx.evidenceCase.findUniqueOrThrow({ where: { sourceType_sourceId: { sourceType: 'Report', sourceId: report.id } } });
+        return { report, alreadyReported: false };
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+      break;
+    } catch (error) {
+      if (!isRetryablePrismaWriteConflict(error) || attempt === maxSerializableWriteAttempts - 1) {
+        throw error;
+      }
+      await waitForSerializableRetry(attempt);
+    }
+  }
+  if (!result) throw new Error('Listing report transaction did not return a result.');
+  const { report, alreadyReported } = result;
+  scheduleEvidenceCopy('Report', report.id);
+
+  if (!alreadyReported) {
+    safelyPublishRealtimeEvent({
+      type: 'ad_updated',
+      payload: {
+        listingId: listing.id,
+        sellerId: listing.sellerId,
+        status: listing.status,
+        reason: 'report',
+      },
+      visibility: {
+        includeAdmins: true,
+        userIds: [listing.sellerId],
+      },
+    });
+
+    safelyPublishRealtimeEvent({
+      type: 'moderation_updated',
+      payload: {
+        entity: 'report',
+        entityId: report.id,
+        status: report.status,
+      },
+      visibility: {
+        includeAdmins: true,
+      },
+    });
+  }
+
+  return {
+    status: 'reported' as const,
+    alreadyReported,
+    report: {
+      id: report.id,
+      listingId: report.listingId,
+      reporterId: report.reporterId,
+      reason: report.reason,
+      details: report.details ?? undefined,
+      status: report.status,
+      createdAt: report.createdAt.toISOString(),
+    } satisfies ReportRecord,
+    listing,
+  };
+}
+
+async function listListingsNeedingReview(pagination?: { skip: number; take: number }) {
+  // Reading a notification is not a moderation decision. Only later human
+  // listing decisions close an assessment; newer assessments reopen review.
+  const rows = await prisma.$queryRaw<{ id: string; reviewReasons: unknown; reviewSubject: string | null }[]>(Prisma.sql`
+    SELECT "Listing"."id", review.metadata->'assessment'->'reasons' AS "reviewReasons",
+      review.metadata->>'subject' AS "reviewSubject"
+    FROM "Listing"
+    LEFT JOIN LATERAL (
+      SELECT alert.metadata FROM "AdminAuditLog" alert
+      WHERE alert."targetType" = 'ModelReview' AND alert."adminId" IS NULL
+        AND alert.metadata->>'listingId' = "Listing"."id"
+        AND alert.metadata->>'subject' IN ('listing', 'image')
+        AND NOT EXISTS (
+          SELECT 1 FROM "AdminAuditLog" decision
+          WHERE decision."targetType" = 'listing' AND decision."targetId" = "Listing"."id"
+            AND (decision.action IN ('approve_listing', 'reject_listing', 'delete_listing')
+              OR (decision.action = 'update_listing' AND decision.metadata->'updates'->>'status' IS NOT NULL))
+            AND decision."createdAt" >= alert."createdAt"
+        )
+      ORDER BY alert."createdAt" DESC, alert.id DESC LIMIT 1
+    ) review ON TRUE
+    WHERE "Listing".status = 'pending'
+      OR ("Listing".status = 'published' AND review.metadata IS NOT NULL)
+    ORDER BY "Listing"."updatedAt" DESC, "Listing".id DESC
+    ${pagination ? Prisma.sql`LIMIT ${pagination.take} OFFSET ${pagination.skip}` : Prisma.empty}
+  `);
+  if (!rows.length) return [];
+  const listings = await prisma.listing.findMany({
+    where: { id: { in: rows.map(row => row.id) } },
+    include: { images: { orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }], take: 4 } },
+  });
+  const byId = new Map(listings.map(listing => [listing.id, listing]));
+  return rows.flatMap(row => {
+    const listing = byId.get(row.id);
+    return listing ? [{ ...toListingRecord(listing),
+      reviewSubject: row.reviewSubject,
+      reviewReasons: Array.isArray(row.reviewReasons) ? row.reviewReasons.filter((reason): reason is string => typeof reason === 'string') : [],
+    }] : [];
+  });
+}
+
+export async function listModerationQueuePage(filters: PaginationInput = {}, focus?: { reportId: string; sourceType: 'Report' | 'UserReport' }) {
+  const pagination = normalizePagination(filters, {
+    defaultLimit: 20,
+    maxLimit: 48,
+  });
+
+  if (!shouldUseDatabaseStore()) {
+    const queue = memoryStore.listModerationQueue();
+
+    if (focus) {
+      queue.listings = [];
+      queue.reports = focus.sourceType === 'Report' ? queue.reports.filter(report => report.id === focus.reportId) : [];
+      queue.userReports = focus.sourceType === 'UserReport' ? queue.userReports.filter(report => report.id === focus.reportId) : [];
+    }
+
+    return {
+      listings: toPaginatedResponse(
+        queue.listings.slice(pagination.skip, pagination.skip + pagination.take),
+        pagination,
+      ).items,
+      reports: toPaginatedResponse(
+        queue.reports.slice(pagination.skip, pagination.skip + pagination.take),
+        pagination,
+      ).items,
+      userReports: toPaginatedResponse(
+        queue.userReports.slice(pagination.skip, pagination.skip + pagination.take),
+        pagination,
+      ).items,
+      pagination: {
+        listings: toPaginatedResponse(
+          queue.listings.slice(
+            pagination.skip,
+            pagination.skip + pagination.take,
+          ),
+          pagination,
+        ).pagination,
+        reports: toPaginatedResponse(
+          queue.reports.slice(pagination.skip, pagination.skip + pagination.take),
+          pagination,
+        ).pagination,
+        userReports: toPaginatedResponse(
+          queue.userReports.slice(
+            pagination.skip,
+            pagination.skip + pagination.take,
+          ),
+          pagination,
+        ).pagination,
+      },
+    };
+  }
+
+  const [listings, reports, userReports] = await Promise.all([
+    focus ? Promise.resolve([]) : listListingsNeedingReview(pagination),
+    prisma.report.findMany({
+      ...(focus ? { where: { id: focus.sourceType === 'Report' ? focus.reportId : { in: [] } } } : {}),
+      include: {
+        listing: {
+          include: {
+            images: {
+              orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+              take: 4,
+            },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      skip: pagination.skip,
+      take: pagination.take,
+    }),
+    prisma.userReport.findMany({
+      ...(focus ? { where: { id: focus.sourceType === 'UserReport' ? focus.reportId : { in: [] } } } : {}),
+      include: {
+        reporter: { select: { id: true, email: true, name: true } },
+        targetUser: { select: { id: true, email: true, name: true } },
+        conversation: {
+          include: {
+            listing: { select: { id: true, title: true } },
+            messages: {
+              orderBy: { createdAt: 'desc' },
+              take: 20,
+              select: { id: true, senderId: true, body: true, status: true, createdAt: true },
+            },
+          },
+        },
+      },
+      orderBy: [{ status: 'asc' }, { createdAt: 'desc' }],
+      skip: pagination.skip,
+      take: pagination.take,
+    }),
+  ]);
+  const listingPage = toPaginatedResponse(listings, pagination);
+  const reportPage = toPaginatedResponse(reports.map(toReportRecord), pagination);
+  const mappedUserReports = userReports.map((report) => ({
+    id: report.id,
+      reporterId: report.reporterId,
+      targetUserId: report.targetUserId,
+      conversationId: report.conversationId ?? undefined,
+      reason: report.reason,
+      details: report.details ?? undefined,
+      status: report.status as UserReportStatus,
+      resolution: (report.resolution ?? undefined) as
+        | UserReportResolution
+        | undefined,
+      resolvedBy: report.resolvedBy ?? undefined,
+      resolvedAt: report.resolvedAt?.toISOString(),
+      createdAt: report.createdAt.toISOString(),
+      updatedAt: report.updatedAt.toISOString(),
+      reporter: report.reporter,
+      targetUser: report.targetUser,
+      conversation: report.conversation
+        ? {
+            id: report.conversation.id,
+            status: report.conversation.status,
+            listing: report.conversation.listing,
+            messages: [...report.conversation.messages].reverse().map((message) => ({
+              ...message,
+              createdAt: message.createdAt.toISOString(),
+            })),
+          }
+        : null,
+    }));
+  const userReportPage = toPaginatedResponse(mappedUserReports, pagination);
+
+  return {
+    listings: listingPage.items,
+    reports: reportPage.items,
+    userReports: userReportPage.items,
+    pagination: {
+      listings: listingPage.pagination,
+      reports: reportPage.pagination,
+      userReports: userReportPage.pagination,
+    },
+  };
+}
+
+export async function setUserReportModerationStatus(
+  reportId: string,
+  resolution: UserReportResolution,
+  admin?: Actor,
+  beforeMutation?: StaffMutationGuard,
+) {
+  if (!shouldUseDatabaseStore()) {
+    return memoryStore.setUserReportModerationStatus(
+      reportId,
+      resolution,
+      admin ? getActorId(admin) : undefined,
+    );
+  }
+
+  const status: UserReportStatus =
+    resolution === 'review'
+      ? 'open'
+      : resolution === 'dismiss'
+        ? 'dismissed'
+        : 'reviewed';
+  const shouldCloseConversation =
+    resolution === 'close_conversation' || resolution === 'restrict';
+  const auditAction: AdminAuditAction =
+    resolution === 'review'
+      ? 'review_report'
+      : resolution === 'dismiss'
+        ? 'dismiss_report'
+        : resolution === 'warn'
+          ? 'warn_user'
+          : 'restrict_conversation';
+
+  const adminId = await getAdminAuditActorId(admin, beforeMutation);
+  const report = await prisma.$transaction(async (tx) => {
+    const existing = await tx.userReport.findUnique({ where: { id: reportId } });
+    if (!existing) return null;
+    if (existing.status !== 'open') return 'already_resolved' as const;
+
+    // Sends and customer block actions hold this pair key through commit. Take
+    // it before the report update's evidence locks, in the same lock order.
+    if (shouldCloseConversation && existing.conversationId) {
+      await lockConversationUserPair(tx, existing.reporterId, existing.targetUserId);
+    }
+    await beforeMutation?.(tx);
+    const claimed = await tx.userReport.updateMany({
+      where: { id: reportId, status: 'open' },
+      data: {
+        status,
+        resolution,
+        resolvedBy: adminId ?? undefined,
+        resolvedAt: resolution === 'review' ? null : new Date(),
+      },
+    });
+    if (claimed.count === 0) return 'already_resolved' as const;
+
+    if (shouldCloseConversation && existing.conversationId) {
+      await tx.conversation.update({
+        where: { id: existing.conversationId },
+        data: { status: 'closed' },
+      });
+      await tx.userBlock.upsert({
+        where: {
+          blockerId_blockedId: {
+            blockerId: existing.reporterId,
+            blockedId: existing.targetUserId,
+          },
+        },
+        create: {
+          blockerId: existing.reporterId,
+          blockedId: existing.targetUserId,
+          conversationId: existing.conversationId,
+          reason: 'admin_moderation',
+        },
+        update: {
+          conversationId: existing.conversationId,
+          reason: 'admin_moderation',
+        },
+      });
+    }
+
+    await createAdminAuditLog(tx, {
+      adminId,
+      action: auditAction,
+      targetType: 'user_report',
+      targetId: reportId,
+      metadata: {
+        resolution,
+        previousStatus: existing.status,
+        nextStatus: status,
+        conversationId: existing.conversationId,
+        reporterId: existing.reporterId,
+        targetUserId: existing.targetUserId,
+      },
+    });
+    return tx.userReport.findUniqueOrThrow({ where: { id: reportId } });
+  });
+
+  if (!report) return { status: 'not_found' as const, report: null };
+  if (report === 'already_resolved') {
+    return { status: 'already_resolved' as const, report: null };
+  }
+  safelyPublishRealtimeEvent({
+    type: 'moderation_updated',
+    payload: { entity: 'report', entityId: report.id, status: report.status },
+    visibility: { includeAdmins: true },
+  });
+  return {
+    status: report.status,
+    report: {
+      id: report.id,
+      reporterId: report.reporterId,
+      targetUserId: report.targetUserId,
+      conversationId: report.conversationId ?? undefined,
+      reason: report.reason,
+      details: report.details ?? undefined,
+      status: report.status as UserReportStatus,
+      resolution: (report.resolution ?? undefined) as
+        | UserReportResolution
+        | undefined,
+      resolvedBy: report.resolvedBy ?? undefined,
+      resolvedAt: report.resolvedAt?.toISOString(),
+      createdAt: report.createdAt.toISOString(),
+      updatedAt: report.updatedAt.toISOString(),
+    },
+  };
+}
+
+export async function setListingModerationStatus(
+  listingId: string,
+  status: Extract<ListingStatus, 'published' | 'rejected' | 'deleted'>,
+  admin?: Actor,
+  beforeMutation?: StaffMutationGuard,
+) {
+  if (!shouldUseDatabaseStore()) {
+    const existingListing = memoryStore.getListing(listingId);
+    const result = memoryStore.setListingModerationStatus(listingId, status);
+
+    if (result.listing) {
+      safelyPublishRealtimeEvent({
+        type: 'moderation_updated',
+        payload: {
+          entity: 'listing',
+          entityId: result.listing.id,
+          status: result.listing.status,
+        },
+        visibility: {
+          includeAdmins: true,
+          userIds: [result.listing.sellerId],
+        },
+      });
+
+      safelyPublishRealtimeEvent({
+        type: 'ad_status_changed',
+        payload: {
+          listingId: result.listing.id,
+          sellerId: result.listing.sellerId,
+          previousStatus: existingListing?.status ?? result.listing.status,
+          status: result.listing.status,
+        },
+        visibility: getListingRealtimeVisibility(
+          result.listing.sellerId,
+          result.listing.status,
+        ),
+      });
+
+      if (result.listing.status === 'deleted') {
+        safelyPublishRealtimeEvent({
+          type: 'ad_deleted',
+          payload: {
+            listingId: result.listing.id,
+            sellerId: result.listing.sellerId,
+          },
+          visibility: {
+            includePublic: true,
+            includeAdmins: true,
+            userIds: [result.listing.sellerId],
+          },
+        });
+      }
+    }
+
+    return result;
+  }
+
+  const identity = await getListing(listingId);
+
+  if (!identity) {
+    return {
+      status: 'not_found' as const,
+      listing: null,
+    };
+  }
+
+  const adminId = await getAdminAuditActorId(admin, beforeMutation);
+  const action: AdminAuditAction =
+    status === 'published'
+      ? 'approve_listing'
+      : status === 'deleted'
+        ? 'delete_listing'
+        : 'reject_listing';
+  const mutation = await prisma.$transaction(async (tx) => {
+    // Use the same advisory-before-row order as seller/admin edits, including
+    // when first publication would otherwise acquire the Listing row first.
+    await lockSellerListingEvidenceEntities(tx, listingId, identity.sellerId);
+    await tx.$executeRaw`SELECT 1 FROM "Listing" WHERE id = ${listingId} FOR UPDATE`;
+    const current = await tx.listing.findUnique({ where: { id: listingId }, include: { images: true } });
+    if (!current) return null;
+    const existing = toListingRecord(current);
+    await beforeMutation?.(tx);
+    await recordDatabaseFirstPublication(tx, listingId, status);
+    const updatedListing = await tx.listing.update({
+      where: { id: listingId },
+      data: { status, compliance: toPrismaJsonObject({ ...existing.compliance, humanDecision: status === 'published' ? 'allow' : 'block', decision: status === 'published' ? 'allow' : existing.compliance.decision }) },
+      include: {
+        images: {
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+        },
+      },
+    });
+
+    await createAdminAuditLog(tx, {
+      adminId,
+      action,
+      targetType: 'listing',
+      targetId: listingId,
+      metadata: {
+        previousStatus: existing.status,
+        nextStatus: status,
+        sellerId: existing.sellerId,
+      },
+    });
+
+    if (updatedListing.status === 'published' && existing.status !== 'published') {
+      await enqueueNotificationDelivery(tx, 'listing-published', updatedListing.id, { listingId: updatedListing.id });
+    }
+
+    return { listing: updatedListing, previousStatus: existing.status };
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
+
+  if (!mutation) return { status: 'not_found' as const, listing: null };
+
+  const mappedListing = toListingRecord(mutation.listing);
+
+  if (mappedListing.status === 'published' && mutation.previousStatus !== 'published') scheduleNotificationDelivery(true);
+
+  safelyPublishRealtimeEvent({
+    type: 'moderation_updated',
+    payload: {
+      entity: 'listing',
+      entityId: mappedListing.id,
+      status: mappedListing.status,
+    },
+    visibility: {
+      includeAdmins: true,
+      userIds: [mappedListing.sellerId],
+    },
+  });
+
+  safelyPublishRealtimeEvent({
+    type: 'ad_status_changed',
+    payload: {
+      listingId: mappedListing.id,
+      sellerId: mappedListing.sellerId,
+      previousStatus: mutation.previousStatus,
+      status: mappedListing.status,
+    },
+    visibility: getListingRealtimeVisibility(
+      mappedListing.sellerId,
+      mappedListing.status,
+    ),
+  });
+
+  if (mappedListing.status === 'deleted') {
+    safelyPublishRealtimeEvent({
+      type: 'ad_deleted',
+      payload: {
+        listingId: mappedListing.id,
+        sellerId: mappedListing.sellerId,
+      },
+      visibility: {
+        includePublic: true,
+        includeAdmins: true,
+        userIds: [mappedListing.sellerId],
+      },
+    });
+  }
+
+  return {
+    status: mappedListing.status,
+    listing: mappedListing,
+  };
+}
+
+export async function setReportModerationStatus(
+  reportId: string,
+  status: Extract<ReportRecord['status'], 'reviewed' | 'dismissed'>,
+  admin?: Actor,
+  listingStatus?: 'rejected' | 'deleted',
+  beforeMutation?: StaffMutationGuard,
+) {
+  const publishListingDecision = (listing: memoryStore.ListingRecord, previousStatus: ListingStatus) => {
+    safelyPublishRealtimeEvent({
+      type: 'moderation_updated', payload: { entity: 'listing', entityId: listing.id, status: listing.status },
+      visibility: { includeAdmins: true, userIds: [listing.sellerId] },
+    });
+    safelyPublishRealtimeEvent({
+      type: 'ad_status_changed',
+      payload: { listingId: listing.id, sellerId: listing.sellerId, previousStatus, status: listing.status },
+      visibility: getListingRealtimeVisibility(listing.sellerId, listing.status),
+    });
+    if (listing.status === 'deleted') safelyPublishRealtimeEvent({
+      type: 'ad_deleted', payload: { listingId: listing.id, sellerId: listing.sellerId },
+      visibility: { includePublic: true, includeAdmins: true, userIds: [listing.sellerId] },
+    });
+  };
+  if (!shouldUseDatabaseStore()) {
+    const result = memoryStore.setReportModerationStatus(reportId, status, listingStatus);
+
+    if (result.report && result.status !== 'already_resolved') {
+      safelyPublishRealtimeEvent({
+        type: 'moderation_updated',
+        payload: {
+          entity: 'report',
+          entityId: result.report.id,
+          status: result.report.status,
+        },
+        visibility: {
+          includeAdmins: true,
+        },
+      });
+    }
+    if ('listing' in result && result.listing && result.previousListingStatus) {
+      publishListingDecision(result.listing, result.previousListingStatus);
+    }
+
+    return { status: result.status, report: result.report };
+  }
+
+  const adminId = await getAdminAuditActorId(admin, beforeMutation);
+  const report = await prisma.$transaction(async (tx) => {
+    const existing = await tx.report.findUnique({ where: { id: reportId }, select: {
+      status: true, listingId: true, reporterId: true, listing: { select: { sellerId: true } },
+    } });
+    if (!existing) return null;
+    if (existing.status !== 'open') return 'already_resolved' as const;
+    // A Report update's evidence trigger needs the listing and participant keys.
+    // Acquire them in the same sorted order as listing/account writes BEFORE
+    // any row lock; taking the Report row first can deadlock with a listing edit.
+    const keys = [`listing:${existing.listingId}`, `user:${existing.reporterId}`,
+      ...(existing.listing ? [`user:${existing.listing.sellerId}`] : [])];
+    for (const key of [...new Set(keys)].sort()) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(771204, hashtext(${key}))`;
+    }
+    if (listingStatus) await tx.$executeRaw`SELECT 1 FROM "Listing" WHERE id = ${existing.listingId} FOR UPDATE`;
+    const currentListing = listingStatus ? await tx.listing.findUnique({
+      where: { id: existing.listingId }, include: { images: true },
+    }) : null;
+    if (listingStatus && !currentListing) return 'listing_not_found' as const;
+    await beforeMutation?.(tx);
+    const claimed = await tx.report.updateMany({
+      where: { id: reportId, status: 'open' },
+      data: { status },
+    });
+    if (!claimed.count) return 'already_resolved' as const;
+    // Claiming the report, mutating the listing and both audit records commit
+    // together. A stale decision or a failure below cannot partially change it.
+    const updatedListing = listingStatus && currentListing ? await tx.listing.update({
+      where: { id: currentListing.id },
+      data: { status: listingStatus, compliance: toPrismaJsonObject({ ...toListingRecord(currentListing).compliance, humanDecision: 'block' }) },
+      include: { images: { orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }] } },
+    }) : null;
+    if (updatedListing && currentListing) await createAdminAuditLog(tx, {
+      adminId, action: listingStatus === 'deleted' ? 'delete_listing' : 'reject_listing',
+      targetType: 'listing', targetId: currentListing.id,
+      metadata: { previousStatus: currentListing.status, nextStatus: listingStatus, sellerId: currentListing.sellerId, reportId },
+    });
+    const updatedReport = await tx.report.findUniqueOrThrow({
+      where: { id: reportId },
+      include: {
+        listing: {
+          include: {
+            images: {
+              orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+            },
+          },
+        },
+      },
+    });
+
+    await createAdminAuditLog(tx, {
+      adminId,
+      action: status === 'reviewed' ? 'review_report' : 'dismiss_report',
+      targetType: 'report',
+      targetId: reportId,
+      metadata: {
+        previousStatus: existing.status,
+        nextStatus: status,
+        listingId: updatedReport.listingId,
+        reporterId: updatedReport.reporterId,
+      },
+    });
+
+    return { report: updatedReport, listing: updatedListing, previousListingStatus: currentListing?.status };
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
+
+  if (!report) {
+    return {
+      status: 'not_found' as const,
+      report: null,
+    };
+  }
+  if (report === 'already_resolved') return { status: 'already_resolved' as const, report: null };
+  if (report === 'listing_not_found') return { status: 'listing_not_found' as const, report: null };
+
+  const mappedReport = toReportRecord(report.report);
+  if (report.listing && report.previousListingStatus) {
+    publishListingDecision(toListingRecord(report.listing), report.previousListingStatus);
+  }
+
+  safelyPublishRealtimeEvent({
+    type: 'moderation_updated',
+    payload: {
+      entity: 'report',
+      entityId: mappedReport.id,
+      status: mappedReport.status,
+    },
+    visibility: {
+      includeAdmins: true,
+    },
+  });
+
+  return {
+    status: mappedReport.status,
+    report: mappedReport,
+  };
+}
+
+export async function listSellerCommissionsPage(
+  sellerId: string,
+  filters: PaginationInput = {},
+) {
+  const pagination = normalizePagination(filters, {
+    defaultLimit: 20,
+    maxLimit: 48,
+  });
+
+  if (!shouldUseDatabaseStore()) {
+    return toPaginatedResponse(
+      memoryStore
+        .listSellerCommissions(sellerId)
+        .slice(pagination.skip, pagination.skip + pagination.take),
+      pagination,
+    );
+  }
+
+  const commissions = await prisma.commission.findMany({
+    where: { sellerId },
+    include: {
+      listing: {
+        include: {
+          images: {
+            orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+            take: 4,
+          },
+        },
+      },
+    },
+    orderBy: { updatedAt: 'desc' },
+    skip: pagination.skip,
+    take: pagination.take,
+  });
+
+  return toPaginatedResponse(commissions.map(toCommissionRecord), pagination);
+}
+
+export async function listAdminCommissionsPage(filters: PaginationInput = {}) {
+  const pagination = normalizePagination(filters, {
+    defaultLimit: 20,
+    maxLimit: 48,
+  });
+
+  if (!shouldUseDatabaseStore()) {
+    return toPaginatedResponse(
+      memoryStore
+        .listAdminCommissions()
+        .slice(pagination.skip, pagination.skip + pagination.take),
+      pagination,
+    );
+  }
+
+  const commissions = await prisma.commission.findMany({
+    include: {
+      listing: {
+        include: {
+          images: {
+            orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+            take: 4,
+          },
+        },
+      },
+    },
+    orderBy: { updatedAt: 'desc' },
+    skip: pagination.skip,
+    take: pagination.take,
+  });
+
+  return toPaginatedResponse(commissions.map(toCommissionRecord), pagination);
+}
+
+export async function updateCommissionSaleAmountForSeller(
+  commissionId: string,
+  sellerId: string,
+  productValue: number,
+) {
+  if (!shouldUseDatabaseStore()) {
+    const result = memoryStore.updateCommissionSaleAmountForSeller(
+      commissionId,
+      sellerId,
+      productValue,
+    );
+
+    if (result.commission && result.status === 'updated') {
+      safelyPublishRealtimeEvent({
+        type: 'commission_updated',
+        payload: {
+          commissionId: result.commission.id,
+          listingId: result.commission.listingId,
+          sellerId: result.commission.sellerId,
+          status: result.commission.status,
+          reason: 'sale_amount_updated',
+        },
+        visibility: {
+          includeAdmins: true,
+          userIds: [result.commission.sellerId],
+        },
+      });
+    }
+
+    return result;
+  }
+
+  const commission = await prisma.commission.findFirst({
+    where: { id: commissionId, sellerId },
+    include: {
+      listing: {
+        include: {
+          images: {
+            orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+          },
+        },
+      },
+    },
+  });
+
+  if (!commission) {
+    return {
+      status: 'not_found' as const,
+      commission: null,
+    };
+  }
+
+  const existingCommission = toCommissionRecord(commission);
+
+  if (
+    existingCommission.status === 'paid' ||
+    existingCommission.status === 'waived'
+  ) {
+    return {
+      status: 'locked' as const,
+      commission: existingCommission,
+    };
+  }
+
+  const updated = await prisma.$transaction(async tx => {
+    // Match administrative status changes and listing/evidence operations:
+    // take the listing evidence key before the Commission row is written.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(771204, hashtext(${'listing:' + commission.listingId}))`;
+    return tx.commission.update({
+      // The database must recheck the lock at the write, including after waiting
+      // for an administrator's concurrently committed paid/waived decision.
+      where: { id: commissionId, sellerId, status: { notIn: ['paid', 'waived'] } },
+      data: {
+        productValue,
+        commissionAmount: calculateCommissionAmount(productValue),
+        status: 'due',
+      },
+      include: {
+        listing: {
+          include: {
+            images: {
+              orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+            },
+          },
+        },
+      },
+    }).catch((error: unknown) => {
+      if (isPrismaKnownRequestError(error, 'P2025')) return null;
+      throw error;
+    });
+  }, { isolationLevel: 'ReadCommitted' });
+
+  if (!updated) {
+    const current = await prisma.commission.findFirst({
+      where: { id: commissionId, sellerId },
+      include: { listing: { include: { images: { orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }] } } } },
+    });
+    return current
+      ? { status: 'locked' as const, commission: toCommissionRecord(current) }
+      : { status: 'not_found' as const, commission: null };
+  }
+
+  const mappedCommission = toCommissionRecord(updated);
+
+  safelyPublishRealtimeEvent({
+    type: 'commission_updated',
+    payload: {
+      commissionId: mappedCommission.id,
+      listingId: mappedCommission.listingId,
+      sellerId: mappedCommission.sellerId,
+      status: mappedCommission.status,
+      reason: 'sale_amount_updated',
+    },
+    visibility: {
+      includeAdmins: true,
+      userIds: [mappedCommission.sellerId],
+    },
+  });
+
+  return {
+    status: 'updated' as const,
+    commission: mappedCommission,
+  };
+}
+
+export async function setCommissionStatusForAdmin(
+  commissionId: string,
+  status: Extract<CommissionStatus, 'due' | 'paid' | 'waived' | 'disputed'>,
+  admin?: Actor,
+  beforeMutation?: StaffMutationGuard,
+) {
+  if (!shouldUseDatabaseStore()) {
+    const result = memoryStore.setCommissionStatusForAdmin(commissionId, status);
+
+    if (result.commission) {
+      safelyPublishRealtimeEvent({
+        type: 'commission_updated',
+        payload: {
+          commissionId: result.commission.id,
+          listingId: result.commission.listingId,
+          sellerId: result.commission.sellerId,
+          status: result.commission.status,
+          reason: 'status_updated',
+        },
+        visibility: {
+          includeAdmins: true,
+          userIds: [result.commission.sellerId],
+        },
+      });
+    }
+
+    return result;
+  }
+
+  const adminId = await getAdminAuditActorId(admin, beforeMutation);
+  const updated = await prisma.$transaction(async (tx) => {
+    const identity = await tx.commission.findUnique({
+      where: { id: commissionId }, select: { listingId: true },
+    });
+    if (!identity) return null;
+    // Evidence capture/deletion also locks this listing key. Acquire it before
+    // the row, then read the audit baseline only after the row lock is granted.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(771204, hashtext(${'listing:' + identity.listingId}))`;
+    await tx.$executeRaw`SELECT 1 FROM "Commission" WHERE id = ${commissionId} FOR UPDATE`;
+    const existing = await tx.commission.findUnique({
+      where: { id: commissionId },
+      select: { status: true },
+    });
+    if (!existing) return null;
+
+    await beforeMutation?.(tx);
+    const commission = await tx.commission.update({
+      where: { id: commissionId },
+      data: {
+        status,
+        paidAt: status === 'paid' ? new Date() : undefined,
+      },
+      include: {
+        listing: {
+          include: {
+            images: {
+              orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+            },
+          },
+        },
+      },
+    }).catch((error: unknown) => {
+      // Only a target removed before this UPDATE is a missing commission.
+      // Connection, transaction and audit failures must retain their cause.
+      if (isPrismaKnownRequestError(error, 'P2025')) return null;
+      throw error;
+    });
+    if (!commission) return null;
+
+    await createAdminAuditLog(tx, {
+      adminId,
+      action: 'update_commission',
+      targetType: 'commission',
+      targetId: commissionId,
+      metadata: {
+        previousStatus: existing.status,
+        nextStatus: status,
+        sellerId: commission.sellerId,
+        listingId: commission.listingId,
+      },
+    });
+
+    return commission;
+  }, { isolationLevel: 'ReadCommitted' });
+
+  if (!updated) {
+    return {
+      status: 'not_found' as const,
+      commission: null,
+    };
+  }
+
+  const mappedCommission = toCommissionRecord(updated);
+
+  safelyPublishRealtimeEvent({
+    type: 'commission_updated',
+    payload: {
+      commissionId: mappedCommission.id,
+      listingId: mappedCommission.listingId,
+      sellerId: mappedCommission.sellerId,
+      status: mappedCommission.status,
+      reason: 'status_updated',
+    },
+    visibility: {
+      includeAdmins: true,
+      userIds: [mappedCommission.sellerId],
+    },
+  });
+
+  return {
+    status: mappedCommission.status,
+    commission: mappedCommission,
+  };
+}

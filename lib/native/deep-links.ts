@@ -1,0 +1,112 @@
+import { appUrl } from '@/lib/app-url';
+
+// Maps between public HTTP URLs and the سوق حمد custom scheme used by
+// native shells (smartstore://). Also exposes a helper to detect in-app
+// browser limitations so we can route to the native app or the system browser.
+
+const appCustomScheme = 'smartstore';
+
+const productionHosts = ['souqhamad.com', 'www.souqhamad.com'];
+
+function getTrustedHosts() {
+  const hosts = new Set<string>(productionHosts);
+  try {
+    hosts.add(new URL(appUrl).host);
+  } catch {
+    // Ignore malformed configured URL.
+  }
+
+  return hosts;
+}
+
+const knownDeepLinkPaths = new Set([
+  '/',
+  '/account',
+  '/account/follows',
+  '/account/listings',
+  '/account/seller-profile',
+  '/admin',
+  '/admin/audit-log',
+  '/admin/commissions',
+  '/admin/listings',
+  '/admin/moderation',
+  '/admin/site-message',
+  '/admin/users',
+  '/commission-agreement',
+  '/commission-policy',
+  '/commissions',
+  '/conversations',
+  '/delete-account',
+  '/favorites',
+  '/listing-policy',
+  '/notifications',
+  '/offline',
+  '/privacy',
+  '/terms',
+]);
+
+export function isSafeInternalPath(pathname: string): boolean {
+  if (!pathname.startsWith('/')) {
+    return false;
+  }
+
+  // Reject protocol-relative and backslash tricks.
+  if (pathname.startsWith('//') || pathname.includes('\\')) {
+    return false;
+  }
+
+  const [base] = pathname.split('?');
+
+  if (base === undefined) {
+    return false;
+  }
+
+  if (knownDeepLinkPaths.has(base)) {
+    return true;
+  }
+
+  // Dynamic routes rendered by the local mobile web host.
+  return /^\/(listings|sellers|conversations)\/[A-Za-z0-9_-]+$/.test(base);
+}
+export function toAppDeepLink(internalUrl: string): string | null {
+  let path = internalUrl;
+
+  try {
+    if (/^https?:\/\//i.test(internalUrl)) {
+      const url = new URL(internalUrl);
+
+      // Only map URLs that belong to our own app origin.
+      if (!getTrustedHosts().has(url.host)) {
+    return null;
+  }
+
+      path = `${url.pathname}${url.search}`;
+  }
+  } catch {
+    return null;
+  }
+
+  const [pathname, search] = path.split('?');
+
+  if (!pathname || !isSafeInternalPath(pathname)) {
+    return null;
+}
+
+  const query = search ? `?${search}` : '';
+
+  return `${appCustomScheme}://${pathname.replace(/^\//, '')}${query}`;
+}
+
+const inAppBrowserPatterns = [
+  /FBAN|FBAV/i, // Facebook
+  /Instagram/i,
+  /Twitter/i,
+  /Line\//i,
+  /MicroMessenger/i, // WeChat
+];
+
+export function isLikelyInAppBrowser(userAgent: string): boolean {
+  return inAppBrowserPatterns.some((pattern) => pattern.test(userAgent));
+}
+
+

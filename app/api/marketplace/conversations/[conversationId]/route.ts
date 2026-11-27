@@ -1,0 +1,369 @@
+import { z } from 'zod';
+
+import {
+  addConversationMessage,
+  blockConversationUser,
+  deleteConversationMessageForUser,
+  deleteConversationForUser,
+  getConversationBlockStatus,
+  getConversationForUser,
+  markConversationsDeliveredForUser,
+  markConversationReadForUser,
+  reportConversationUser,
+  shareSellerContact,
+  unblockConversationUser,
+} from '@/agent/marketplace/repository';
+import { reserveIdempotencyKey } from '@/lib/api/idempotency';
+import { completeConversationResponse, replayConversationResponse } from '@/lib/api/conversation-replay';
+import { noStoreHeaders } from '@/lib/api/no-store';
+import { enforceApiRateLimit } from '@/lib/api/rate-limit';
+import { rejectOversizedRequest } from '@/lib/api/request-size';
+import { getAuthSession } from '@/lib/auth/session';
+import { notifyConversationMessage } from '@/lib/push/conversation-notifications';
+
+export const dynamic = 'force-dynamic';
+
+const sendMessageSchema = z.object({
+  body: z.string().trim().min(1).max(1000),
+});
+const shareContactSchema = z.object({
+  action: z.literal('share_contact'),
+});
+const reportUserSchema = z.object({
+  action: z.literal('report_user'),
+  reason: z.string().trim().min(2).max(120).default('conversation_report'),
+  details: z.string().trim().max(1000).optional(),
+});
+const blockUserSchema = z.object({
+  action: z.literal('block_user'),
+  reason: z.string().trim().max(120).optional(),
+});
+const unblockUserSchema = z.object({
+  action: z.literal('unblock_user'),
+});
+const deleteMessageSchema = z.object({
+  action: z.literal('delete_message'),
+  messageId: z.string().min(1),
+  mode: z.enum(['for_me', 'for_everyone']),
+});
+const conversationPostSchema = z.union([
+  sendMessageSchema,
+  shareContactSchema,
+  reportUserSchema,
+  blockUserSchema,
+  unblockUserSchema,
+  deleteMessageSchema,
+]);
+const maxConversationMessageRequestBytes = 8 * 1024;
+
+type RouteContext = {
+  params: Promise<{
+    conversationId: string;
+  }>;
+};
+
+export async function GET(request: Request, context: RouteContext) {
+  const session = getAuthSession(request);
+
+  if (!session) {
+    return Response.json(
+      {
+        error: 'auth_required',
+        message: 'Sign-in is required to view this conversation.',
+      },
+      { status: 401 },
+    );
+  }
+
+  const { conversationId } = await context.params;
+  await markConversationsDeliveredForUser([conversationId], session.user.id);
+  await markConversationReadForUser(conversationId, session.user.id);
+  const conversation = await getConversationForUser(conversationId, session.user.id);
+
+  if (!conversation) {
+    return Response.json({ error: 'conversation_not_found' }, { status: 404 });
+  }
+
+  const blockStatus = await getConversationBlockStatus(
+    conversationId,
+    session.user.id,
+  );
+
+  return Response.json(
+    { conversation, blockStatus },
+    { headers: noStoreHeaders },
+  );
+}
+
+export async function DELETE(request: Request, context: RouteContext) {
+  const session = getAuthSession(request);
+
+  if (!session) {
+    return Response.json(
+      {
+        error: 'auth_required',
+        message: 'Sign-in is required to delete conversations.',
+      },
+      { status: 401 },
+    );
+  }
+
+  const { conversationId } = await context.params;
+  const result = await deleteConversationForUser(conversationId, session.user.id);
+
+  if (result.status === 'not_found') {
+    return Response.json({ error: 'conversation_not_found' }, { status: 404 });
+  }
+
+  return Response.json(
+    {
+      status: 'deleted',
+      message: 'Conversation deleted successfully.',
+    },
+    { headers: noStoreHeaders },
+  );
+}
+
+export async function POST(request: Request, context: RouteContext) {
+  const session = getAuthSession(request);
+
+  if (!session) {
+    return Response.json(
+      {
+        error: 'auth_required',
+        message: 'Sign-in is required to send messages.',
+      },
+      { status: 401 },
+    );
+  }
+
+  const rateLimitResponse = await enforceApiRateLimit(request, {
+    namespace: 'message',
+    actorId: session.user.id,
+    maxRequests: 30,
+    windowMs: 60_000,
+  });
+
+  if (rateLimitResponse) {
+    return rateLimitResponse;
+  }
+
+  const oversizedRequestResponse = await rejectOversizedRequest(
+    request,
+    maxConversationMessageRequestBytes,
+    'Conversation message request body is too large.',
+  );
+
+  if (oversizedRequestResponse) {
+    return oversizedRequestResponse;
+  }
+
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return Response.json({ error: 'invalid_json' }, { status: 400 });
+  }
+
+  const parsed = conversationPostSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return Response.json(
+      { error: 'invalid_request', details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  const { conversationId } = await context.params;
+  const action = 'action' in parsed.data ? parsed.data.action : 'send_message';
+  const messageBody = 'body' in parsed.data ? parsed.data.body : '';
+  const idempotency = await reserveIdempotencyKey(request, {
+    namespace:
+      action === 'share_contact'
+        ? 'contact_share'
+        : action === 'report_user'
+          ? 'conversation_user_report'
+          : action === 'block_user'
+            ? 'conversation_user_block'
+            : action === 'unblock_user'
+              ? 'conversation_user_unblock'
+              : action === 'delete_message'
+                ? 'conversation_message_delete'
+              : 'message_send',
+    actorKey: `${session.user.id}:${conversationId}`,
+  });
+
+  if (idempotency?.response) {
+    return replayConversationResponse(idempotency.response, session.user.id, conversationId);
+  }
+
+  let result:
+    | Awaited<ReturnType<typeof shareSellerContact>>
+    | Awaited<ReturnType<typeof reportConversationUser>>
+    | Awaited<ReturnType<typeof blockConversationUser>>
+    | Awaited<ReturnType<typeof unblockConversationUser>>
+    | Awaited<ReturnType<typeof deleteConversationMessageForUser>>
+    | Awaited<ReturnType<typeof addConversationMessage>>;
+
+  let replayedMessage = false;
+  if ('body' in parsed.data) {
+    const delivery = await addConversationMessage(
+      conversationId,
+      session.user,
+      messageBody,
+      { operationKey: idempotency?.operationKey },
+    );
+    if ('replayed' in delivery) {
+      const { replayed, ...publicResult } = delivery;
+      replayedMessage = Boolean(replayed);
+      result = publicResult;
+    } else result = delivery;
+  } else if (parsed.data.action === 'share_contact') {
+    result = await shareSellerContact(conversationId, session.user);
+  } else if (parsed.data.action === 'report_user') {
+    result = await reportConversationUser(conversationId, session.user, {
+      reason: parsed.data.reason,
+      details: parsed.data.details,
+    });
+  } else if (parsed.data.action === 'block_user') {
+    result = await blockConversationUser(
+      conversationId,
+      session.user,
+      parsed.data.reason,
+    );
+  } else if (parsed.data.action === 'delete_message') {
+    result = await deleteConversationMessageForUser(
+      conversationId,
+      parsed.data.messageId,
+      session.user.id,
+      parsed.data.mode,
+    );
+  } else {
+    result = await unblockConversationUser(conversationId, session.user);
+  }
+
+  if (result.status === 'not_found') {
+    const responseBody = { error: 'conversation_not_found' };
+
+    return completeConversationResponse(idempotency, responseBody, 404);
+  }
+
+  if (result.status === 'conversation_closed') {
+    const responseBody = {
+      error: 'conversation_closed',
+      conversation: result.conversation,
+    };
+
+    return completeConversationResponse(idempotency, responseBody, 409);
+  }
+
+  if (result.status === 'conversation_blocked') {
+    const responseBody = {
+      error: 'conversation_blocked',
+      message: 'This conversation is blocked.',
+      conversation: result.conversation,
+      blockStatus: result.blockStatus,
+    };
+
+    return completeConversationResponse(idempotency, responseBody, 409);
+  }
+
+  if (result.status === 'not_allowed') {
+    const responseBody = {
+      error: 'message_delete_not_allowed',
+      conversation: result.conversation,
+    };
+
+    return completeConversationResponse(idempotency, responseBody, 403);
+  }
+
+  if (result.status === 'missing_phone') {
+    const responseBody = {
+      error: 'contact_phone_required',
+      message: 'Add your mobile number in account settings before sharing it.',
+      conversation: result.conversation,
+    };
+
+    return completeConversationResponse(idempotency, responseBody, 409);
+  }
+
+  if (result.status === 'message_blocked') {
+    const responseBody = {
+      error: 'message_blocked',
+      message:
+        'This message contains marketplace policy content that is not allowed in buyer-seller chat.',
+      reasons: result.reasons,
+      conversation: result.conversation,
+    };
+
+    return completeConversationResponse(idempotency, responseBody, 422);
+  }
+
+  if (result.status === 'already_reported') {
+    const responseBody = {
+      error: 'already_reported',
+      message: 'You already have an open report on this conversation.',
+      report: result.report,
+      conversation: result.conversation,
+    };
+
+    return completeConversationResponse(idempotency, responseBody, 409);
+  }
+
+  if (result.status === 'blocked') {
+    const responseBody = {
+      ...result,
+      blockStatus: {
+        blocked: true,
+        blockedByMe: true,
+        blockerId: session.user.id,
+        blockedUserId: result.block?.blockedId,
+      },
+    };
+
+    return completeConversationResponse(idempotency, responseBody, 201);
+  }
+
+  if (result.status === 'not_blocked') {
+    const responseBody = {
+      error: 'conversation_not_blocked_by_user',
+      message: 'This conversation is not blocked by the current user.',
+      conversation: result.conversation,
+      blockStatus: result.blockStatus,
+    };
+
+    return completeConversationResponse(idempotency, responseBody, 409);
+  }
+
+  if (result.status === 'unblocked') {
+    const responseBody = {
+      ...result,
+      blockStatus: result.blockStatus ?? {
+        blocked: false,
+        blockedByMe: false,
+      },
+    };
+
+    return completeConversationResponse(idempotency, responseBody, 200);
+  }
+
+  if (
+    !replayedMessage &&
+    'body' in parsed.data &&
+    result.status === 'sent' &&
+    result.conversation &&
+    result.message
+  ) {
+    if (process.env.SMARTSTORE_MARKETPLACE_STORE !== 'database') await notifyConversationMessage({
+      conversation: result.conversation,
+      message: result.message,
+      senderName: session.user.name,
+    }).catch((error) => {
+      const errorName = error instanceof Error ? error.name : 'UnknownError';
+      console.warn(`[push_notifications] message_notify_failed=${errorName}`);
+    });
+  }
+
+  return completeConversationResponse(idempotency, result, 201);
+}

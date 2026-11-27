@@ -1,0 +1,183 @@
+import { assertStaffMutationAccess, withStaffMutationProtection } from '@/lib/auth/staff-mutation';
+import { z } from 'zod';
+import { actOnCaseEvidence, readCaseEvidence, withEvidenceProtection } from '@/agent/marketplace/evidence';
+
+import { setReportModerationStatus } from '@/agent/marketplace/repository';
+import { enforceApiRateLimit } from '@/lib/api/rate-limit';
+import { rejectOversizedRequest } from '@/lib/api/request-size';
+import { hasVerifiedModeratorAccess } from '@/lib/auth/authorization';
+import { getAuthSession } from '@/lib/auth/session';
+import { prisma } from '@/lib/db/prisma';
+
+const maxReportModerationActionRequestBytes = 4 * 1024;
+
+const reportActionSchema = z.object({
+  action: z.enum(['review', 'dismiss', 'reject_listing', 'delete_listing']),
+});
+
+type RouteContext = {
+  params: Promise<{
+    reportId: string;
+  }>;
+};
+
+function getReportStatus(action: z.infer<typeof reportActionSchema>['action']) {
+  return action === 'dismiss' ? 'dismissed' : 'reviewed';
+}
+
+async function enforceModerationReportMutationRateLimit(
+  request: Request,
+  moderatorId: string,
+) {
+  return enforceApiRateLimit(request, {
+    namespace: 'moderation_report_mutation',
+    actorId: moderatorId,
+    maxRequests: 120,
+    windowMs: 60_000,
+  });
+}
+
+export async function PATCH(request: Request, context: RouteContext) {
+  return withStaffMutationProtection(patchWithCurrentAccess)(request, context);
+}
+
+async function patchWithCurrentAccess(request: Request, context: RouteContext) {
+  const session = getAuthSession(request);
+
+  if (!session) {
+    return Response.json({ error: 'auth_required' }, { status: 401 });
+  }
+
+  if (!(await hasVerifiedModeratorAccess(session))) {
+    return Response.json({ error: 'admin_required' }, { status: 403 });
+  }
+
+  const rateLimitResponse = await enforceModerationReportMutationRateLimit(
+    request,
+    session.user.id,
+  );
+
+  if (rateLimitResponse) {
+    return rateLimitResponse;
+  }
+
+  const oversizedRequestResponse = await rejectOversizedRequest(
+    request,
+    maxReportModerationActionRequestBytes,
+  );
+
+  if (oversizedRequestResponse) {
+    return oversizedRequestResponse;
+  }
+
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return Response.json({ error: 'invalid_json' }, { status: 400 });
+  }
+
+  const { reportId } = await context.params;
+  const evidenceResponse = await actOnCaseEvidence('Report', reportId, session, payload);
+  if (evidenceResponse) return evidenceResponse;
+  const parsed = reportActionSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return Response.json(
+      { error: 'invalid_request', details: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
+  const result = await setReportModerationStatus(
+    reportId,
+    getReportStatus(parsed.data.action),
+    session.user,
+    parsed.data.action === 'delete_listing' ? 'deleted' : parsed.data.action === 'reject_listing' ? 'rejected' : undefined,
+    tx => assertStaffMutationAccess(tx, session, 'moderator'),
+  );
+
+  if (result.status === 'not_found') {
+    return Response.json({ error: 'report_not_found' }, { status: 404 });
+  }
+  if (result.status === 'already_resolved') {
+    return Response.json({ error: 'report_already_resolved' }, { status: 409 });
+  }
+  if (result.status === 'listing_not_found') {
+    return Response.json({ error: 'listing_not_found' }, { status: 404 });
+  }
+
+  return Response.json(result);
+}
+
+export async function DELETE(request: Request, context: RouteContext) {
+  return withStaffMutationProtection(deleteWithCurrentAccess)(request, context);
+}
+
+async function deleteWithCurrentAccess(request: Request, context: RouteContext) {
+  return withEvidenceProtection(deleteReport)(request, context);
+}
+
+async function deleteReport(request: Request, context: RouteContext) {
+  const session = getAuthSession(request);
+
+  if (!session) {
+    return Response.json({ error: 'auth_required' }, { status: 401 });
+  }
+
+  if (!(await hasVerifiedModeratorAccess(session))) {
+    return Response.json({ error: 'admin_required' }, { status: 403 });
+  }
+
+  const rateLimitResponse = await enforceModerationReportMutationRateLimit(
+    request,
+    session.user.id,
+  );
+
+  if (rateLimitResponse) {
+    return rateLimitResponse;
+  }
+
+  const { reportId } = await context.params;
+  const report = await prisma.report.findUnique({
+    where: { id: reportId },
+    select: { id: true, status: true },
+  });
+
+  if (!report) {
+    return Response.json({ error: 'report_not_found' }, { status: 404 });
+  }
+
+  if (report.status === 'open') {
+    return Response.json({ error: 'report_must_be_closed' }, { status: 409 });
+  }
+
+  await prisma.$transaction(async tx => {
+    await assertStaffMutationAccess(tx, session, 'moderator');
+    await tx.report.delete({ where: { id: reportId } });
+    await tx.adminAuditLog.create({
+      data: {
+        adminId: session.user.id,
+        action: 'dismiss_report',
+        targetType: 'report',
+        targetId: reportId,
+        metadata: {
+          operation: 'moderation_report_delete',
+          status: report.status,
+        },
+      },
+    });
+  });
+
+  return Response.json({ status: 'deleted', reportId });
+}
+
+export async function GET(request: Request, context: RouteContext) {
+  const session = getAuthSession(request);
+  if (!session) return Response.json({ error: 'auth_required' }, { status: 401 });
+  if (!(await hasVerifiedModeratorAccess(session))) return Response.json({ error: 'admin_required' }, { status: 403 });
+  const limited = await enforceModerationReportMutationRateLimit(request, session.user.id);
+  if (limited) return limited;
+  return readCaseEvidence('Report', (await context.params).reportId, session.user.id, request);
+}

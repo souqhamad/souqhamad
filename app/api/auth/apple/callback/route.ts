@@ -1,0 +1,233 @@
+import { NextResponse } from 'next/server';
+
+import { fetchWithTimeout } from '@/lib/api/fetch-timeout';
+import { enforceApiRateLimit } from '@/lib/api/rate-limit';
+import { getRequestContentLength, rejectOversizedRequest } from '@/lib/api/request-size';
+import { getAppBaseUrl } from '@/lib/app-url';
+import {
+  createAppleClientSecret,
+  getAppleClientId,
+  isAppleAuthConfigured,
+  verifyAppleIdentityToken,
+} from '@/lib/auth/apple';
+import { normalizeAuthEmail } from '@/lib/auth/identity';
+import { persistUserRegistration } from '@/lib/auth/registration';
+import { appleGrantFromTokenResponse } from '@/lib/auth/apple-authorization';
+import {
+  createMobileAuthCallbackUrl,
+  createMobileAuthTicket,
+  isMobileAuthStateValid,
+  parseMobileAuthState,
+} from '@/lib/auth/mobile-oauth';
+import {
+  clearOauthStateCookie,
+  createSessionCookie,
+  getOauthState,
+  isOauthStateValid,
+  type AuthSessionUser,
+} from '@/lib/auth/session';
+
+type AppleTokenResponse = {
+  id_token?: string;
+  refresh_token?: string;
+  access_token?: string;
+  error?: string;
+};
+
+type AppleUserPayload = {
+  name?: {
+    firstName?: string;
+    lastName?: string;
+  };
+  email?: string;
+};
+
+const maxAppleCallbackRequestBytes = 16 * 1024;
+
+function redirectToHome(request: Request, cookie?: string) {
+  // Apple's form_post must become a GET when leaving the callback; preserving
+  // POST would send its credentials to a page that only handles GET.
+  const response = NextResponse.redirect(new URL('/', getAppBaseUrl(request)), request.method === 'POST' ? 303 : 307);
+
+  if (cookie) {
+    response.headers.append('Set-Cookie', cookie);
+  }
+
+  response.headers.append('Set-Cookie', clearOauthStateCookie());
+  return response;
+}
+
+function parseAppleUserName(value: string | null) {
+  if (!value) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as AppleUserPayload;
+    const name = [parsed.name?.firstName, parsed.name?.lastName]
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+
+    return name || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readCallbackParams(request: Request) {
+  if (request.method === 'POST') {
+    const form = await request.formData();
+
+    return {
+      code: String(form.get('code') ?? ''),
+      state: String(form.get('state') ?? ''),
+      idToken: String(form.get('id_token') ?? ''),
+      name: parseAppleUserName(String(form.get('user') ?? '') || null),
+    };
+  }
+
+  const url = new URL(request.url);
+
+  return {
+    code: url.searchParams.get('code') ?? '',
+    state: url.searchParams.get('state') ?? '',
+    idToken: url.searchParams.get('id_token') ?? '',
+    name: parseAppleUserName(url.searchParams.get('user')),
+  };
+}
+
+async function handleAppleCallback(request: Request) {
+  const declaredLength = getRequestContentLength(request);
+  if (declaredLength !== null && declaredLength > maxAppleCallbackRequestBytes) {
+    return (await rejectOversizedRequest(request, maxAppleCallbackRequestBytes,
+      'Apple sign-in callback request body is too large.'))!;
+  }
+  const rateLimitResponse = await enforceApiRateLimit(request, {
+    namespace: 'auth_apple_callback', maxRequests: 60, windowMs: 60_000,
+  });
+  if (rateLimitResponse) return rateLimitResponse;
+
+  const oversizedRequest = await rejectOversizedRequest(
+    request,
+    maxAppleCallbackRequestBytes,
+    'Apple sign-in callback request body is too large.',
+  );
+
+  if (oversizedRequest) {
+    return oversizedRequest;
+  }
+
+  let callbackParams: Awaited<ReturnType<typeof readCallbackParams>>;
+
+  try {
+    callbackParams = await readCallbackParams(request);
+  } catch {
+    return new Response('Invalid Apple sign-in callback.', { status: 400 });
+  }
+
+  const { code, idToken, name, state } = callbackParams;
+  const mobileState = parseMobileAuthState(state);
+  const storedState = getOauthState(request);
+
+  if (!code || !idToken || !state || (mobileState
+      ? !isMobileAuthStateValid(state, storedState)
+      : !isOauthStateValid(state, storedState))) {
+    return new Response('Invalid Apple sign-in state.', { status: 400 });
+  }
+
+  if (!isAppleAuthConfigured()) {
+    console.warn('[apple_auth] callback_unavailable=missing_config');
+    return new Response('Apple sign-in is temporarily unavailable.', { status: 503 });
+  }
+
+  const clientId = getAppleClientId();
+  const redirectUri = new URL(
+    '/api/auth/apple/callback',
+    getAppBaseUrl(request),
+  );
+  let tokenResponse: Response;
+
+  try {
+    tokenResponse = await fetchWithTimeout('https://appleid.apple.com/auth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: createAppleClientSecret(),
+        redirect_uri: redirectUri.toString(),
+        grant_type: 'authorization_code',
+      }),
+    });
+  } catch {
+    return new Response('Apple token exchange failed.', { status: 502 });
+  }
+
+  const tokenJson = (await tokenResponse.json().catch(() => null)) as
+    | AppleTokenResponse
+    | null;
+
+  if (!tokenResponse.ok || tokenJson?.error) {
+    return new Response('Apple token exchange failed.', { status: 502 });
+  }
+
+  const identity = await verifyAppleIdentityToken(
+    tokenJson?.id_token ?? idToken,
+    clientId,
+  );
+
+  if (!identity) {
+    return new Response('Apple account email could not be verified.', {
+      status: 502,
+    });
+  }
+
+  const user: AuthSessionUser = {
+    id: `apple:${identity.sub}`,
+    email: normalizeAuthEmail(identity.email),
+    name,
+  };
+  let registeredUser = user;
+  const authorization = appleGrantFromTokenResponse(tokenJson, clientId, identity.sub);
+  if (!authorization && process.env.NODE_ENV === 'production') return new Response('Apple token exchange failed.', { status: 502 });
+
+  try {
+    registeredUser = await persistUserRegistration(request, user, authorization);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'UnknownError';
+
+    if (errorMessage === 'ACCOUNT_SOFT_DELETED') {
+      return new Response('This account has been deactivated.', {
+        status: 403,
+      });
+    }
+
+    const errorName = error instanceof Error ? error.name : 'UnknownError';
+    console.error(`[apple_auth] registration_failed=${errorName}`);
+
+    return new Response('Apple registration could not be completed.', {
+      status: 502,
+    });
+  }
+
+  if (mobileState) {
+    const response = NextResponse.redirect(
+      createMobileAuthCallbackUrl(createMobileAuthTicket(registeredUser)),
+      request.method === 'POST' ? 303 : 307,
+    );
+
+    response.headers.append('Set-Cookie', clearOauthStateCookie());
+    return response;
+  }
+
+  return redirectToHome(request, createSessionCookie(registeredUser));
+}
+
+export async function GET(request: Request) {
+  return handleAppleCallback(request);
+}
+
+export async function POST(request: Request) {
+  return handleAppleCallback(request);
+}
