@@ -7,7 +7,7 @@ mobile repository; neither Playwright browser project runs an installed native a
 
 ## Required native and PostgreSQL contracts
 
-`Mobile And PostgreSQL Contracts` checks out `mahersss024-oss/app` into `AI` at the
+`Mobile And PostgreSQL Contracts` checks out `souqhamad/souqhamad-app` into `AI` at the
 immutable commit recorded in `.github/workflows/production-gate.yml`. Update that
 commit deliberately when validating a newer server/mobile pair. It installs both
 lockfiles, runs the mobile application's full type/lint and helper test commands,
@@ -17,12 +17,9 @@ real React reconciliation checks have their browser prerequisite instead of skip
 This job runs on every main push, pull request and manual workflow run; it does
 not depend on the optional staging-database setting.
 
-The mobile repository is private. The server repository secret
-`MOBILE_REPO_DEPLOY_KEY` holds a dedicated SSH deploy key registered read-only on
-the mobile repository. Checkout does not persist that credential. Fork pull requests
-cannot read this secret and cannot pass this private-source check until run in a
-trusted repository context; the workflow never uses `pull_request_target` to give
-untrusted code access. The database and test processes receive no hosted secrets.
+The mobile checkout uses the public repository and the standard read-only workflow
+token, with credential persistence disabled. The same checkout works for fork pull
+requests. The database and test processes receive no hosted secrets.
 
 Its pinned PostgreSQL 18.3 service covers the production PostgreSQL major
 version on Render and is created for that job only. Port 55432 and database

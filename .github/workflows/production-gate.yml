@@ -180,11 +180,10 @@ jobs:
       - name: Checkout pinned native application
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: mahersss024-oss/app
+          repository: souqhamad/souqhamad-app
           # Update deliberately when validating a new server/mobile version pair.
-          ref: a603c668c19bd2ee703843481cd344975d250452
+          ref: bffa7fbb2827888ddd11f8b7234376fed4b2ffd3
           path: AI
-          ssh-key: ${{ secrets.MOBILE_REPO_DEPLOY_KEY }}
           persist-credentials: false
 
       - name: Setup pnpm

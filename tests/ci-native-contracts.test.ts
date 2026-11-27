@@ -78,8 +78,8 @@ test('native backend CI is mandatory and uses an ephemeral loopback PostgreSQL s
   assert.equal(database.password, postgres.env?.POSTGRES_PASSWORD);
   assert.equal(job.env?.SMARTSTORE_CI_DB_TESTS, '1');
   const secretReferences = JSON.stringify(job).match(/secrets\.[A-Z0-9_]+/g) ?? [];
-  assert.deepEqual(secretReferences, ['secrets.MOBILE_REPO_DEPLOY_KEY'],
-    'The only credential in this job is the separate read-only key for the private mobile source repository');
+  assert.deepEqual(secretReferences, [],
+    'Public mobile checkout and the isolated PostgreSQL job must run without repository secrets');
   assert.doesNotMatch(JSON.stringify(job.env), /secrets\./, 'The disposable database receives no hosted database secrets');
   assert.equal(workflow.permissions.contents, 'read');
 });
@@ -88,13 +88,14 @@ test('native CI checks a reproducible app revision and executes full mobile chec
   const job = workflow.jobs['mobile-contracts'];
   assert.ok(job);
   const checkout = job.steps.find(step => step.uses?.startsWith('actions/checkout@') &&
-    effectiveValue(step.with?.repository, job) === 'mahersss024-oss/app');
+    effectiveValue(step.with?.repository, job) === 'souqhamad/souqhamad-app');
   assert.ok(checkout, 'Checkout must use the independent mobile repository');
   assert.equal(checkout.with?.path, 'AI');
   assert.match(String(effectiveValue(checkout.with?.ref, job)), /^[a-f0-9]{40}$/,
     'Pair this server revision with an immutable mobile commit, not mutable main');
   assert.equal(checkout.with?.['persist-credentials'], false);
-  assert.equal(checkout.with?.['ssh-key'], '${{ secrets.MOBILE_REPO_DEPLOY_KEY }}');
+  assert.equal(checkout.with?.['ssh-key'], undefined);
+  assert.equal(checkout.with?.token, undefined, 'Use only the standard read-only workflow token');
   const pnpm = job.steps.find(step => step.uses?.startsWith('pnpm/action-setup@'));
   assert.ok(pnpm, 'CI must install the repository package manager explicitly');
   assert.equal(String(pnpm.with?.version), '10.32.1');
