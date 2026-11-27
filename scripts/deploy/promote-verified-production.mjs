@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-export const productionRepository = 'mahersss024-oss/smartstoreai1';
+export const productionRepository = 'souqhamad/souqhamad';
 export const productionGatePath = '.github/workflows/production-gate.yml';
 export const requiredPromotionJobs = [
   'Quality, Build, And Audit', 'Browser E2E (desktop-chromium)',

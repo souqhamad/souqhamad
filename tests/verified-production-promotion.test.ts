@@ -4,9 +4,10 @@ import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import test from 'node:test';
 
-import { eligiblePromotionEvent, productionRepository, promoteVerifiedProduction, requestRenderDeployment,
+import { eligiblePromotionEvent, promoteVerifiedProduction, requestRenderDeployment,
   requiredPromotionJobs } from '../scripts/deploy/promote-verified-production.mjs';
 
+const productionRepository = 'souqhamad/souqhamad';
 const targetSha = 'b'.repeat(40);
 const beforeSha = 'a'.repeat(40);
 const newerSha = 'c'.repeat(40);
@@ -76,6 +77,10 @@ test('production promotion rejects failed, fork, PR, manual and malformed events
     (event: ReturnType<typeof harness>['event']) => { event.workflow_run.head_branch = 'feature'; },
     (event: ReturnType<typeof harness>['event']) => { event.workflow_run.head_repository.full_name = 'someone/fork'; },
     (event: ReturnType<typeof harness>['event']) => { event.repository.full_name = 'someone/fork'; },
+    (event: ReturnType<typeof harness>['event']) => {
+      event.repository.full_name = 'mahersss024-oss/smartstoreai1';
+      event.workflow_run.head_repository.full_name = 'mahersss024-oss/smartstoreai1';
+    },
     (event: ReturnType<typeof harness>['event']) => { event.workflow_run.head_sha = 'branch; arbitrary'; },
     (event: ReturnType<typeof harness>['event']) => { event.workflow_run.run_attempt = 0; },
     (event: ReturnType<typeof harness>['event']) => { event.workflow_run.id = -1; },
