@@ -1,0 +1,176 @@
+# سوق حمد Database Production
+
+سوق حمد is standardized on PostgreSQL with Prisma.
+
+## Recommended Providers
+
+- Supabase: best when the project also needs hosted image storage and dashboard tools.
+- Neon: best when the project needs lightweight hosted PostgreSQL with Vercel-friendly branching.
+
+## Environment Variables
+
+```env
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE?schema=public
+NEXT_PUBLIC_APP_URL=https://www.smartstore-ai.com
+SMARTSTORE_MAX_LISTINGS_PER_SELLER=100
+SMARTSTORE_DEEPSEEK_MAX_CONCURRENT_REQUESTS=100
+SMARTSTORE_DEEPSEEK_MAX_QUEUED_REQUESTS=2000
+SMARTSTORE_DEEPSEEK_QUEUE_TIMEOUT_MS=60000
+SMARTSTORE_OBJECT_STORAGE_TIMEOUT_MS=30000
+```
+
+Keep this value server-side only.
+`SMARTSTORE_MAX_LISTINGS_PER_SELLER` controls saved non-deleted listings per
+seller account. It defaults to `100` when unset. Any positive integer configured
+in Render is used as the active limit; this does not limit the total platform
+listings across all sellers. Keep this variable managed in the Render dashboard
+so production can raise or lower the limit without a code change.
+
+The DeepSeek concurrency defaults above were validated with real staged load
+tests up to 500 concurrent chat users. `SMARTSTORE_DEEPSEEK_MAX_CONCURRENT_REQUESTS`
+caps active provider calls, `SMARTSTORE_DEEPSEEK_MAX_QUEUED_REQUESTS` prevents
+unbounded in-memory queue growth, and `SMARTSTORE_DEEPSEEK_QUEUE_TIMEOUT_MS`
+keeps overloaded requests from hanging indefinitely.
+
+## Local And Production Commands
+
+```bash
+docker compose up -d postgres
+pnpm db:generate
+pnpm db:migrate
+pnpm db:deploy
+pnpm db:push
+pnpm db:studio
+```
+
+Use `pnpm db:migrate` for development migrations and `pnpm db:deploy` in production deployment pipelines. Use `pnpm db:push` for quick local schema syncing when you do not need a migration file yet.
+
+## Core Tables
+
+The Prisma schema includes:
+
+- `User`
+- `Listing`
+- `ListingImage`
+- `Conversation`
+- `ConversationMessage`
+- `Favorite`
+- `Report`
+- `Commission`
+- `AdminAuditLog`
+- `PushSubscription`
+
+## Runtime Store
+
+The app supports two marketplace stores:
+
+- `SMARTSTORE_MARKETPLACE_STORE=file`: local development fallback.
+- `SMARTSTORE_MARKETPLACE_STORE=database`: production PostgreSQL through Prisma.
+
+When the database store is enabled, listings, images, conversations, messages, favorites, reports, moderation queues, commissions, and admin commission actions run through Prisma. Keep the file store only as a development fallback.
+
+## Production Notes
+
+- Use hosted object storage for listing images before public launch; database `data:` image URLs are only a development fallback.
+- Run `pnpm db:deploy` during deployment after setting `DATABASE_URL`.
+- Set `SMARTSTORE_MARKETPLACE_STORE=database` in production.
+- Keep `SMARTSTORE_ADMIN_EMAILS` restricted to trusted admin account emails.
+- Owner maintenance uses signed previews, explicit confirmations and server-side
+  owner authorization. The retired `SMARTSTORE_ENABLE_ADMIN_MAINTENANCE_CLEANUP`
+  variable no longer enables or disables it. Ordinary cleanup retains its
+  eligibility/evidence guards; the separately confirmed full market reset is
+  described in [owner-market-reset.ar.md](owner-market-reset.ar.md).
+- Configure `APPLE_NATIVE_CLIENT_ID` (the iOS bundle identifier),
+  `APPLE_TEAM_ID`, `APPLE_KEY_ID`, and `APPLE_PRIVATE_KEY` for native Apple
+  sign-in. `APPLE_CLIENT_ID` is the separate web Services ID when web Apple
+  sign-in is enabled.
+
+### Apple authorization and account deletion
+
+Apply migration `20261102000000_store_apple_authorization_tokens` before deploying
+the updated server. Successful Apple code exchange stores the revocable refresh
+token (or access token fallback) in `User.appleAuthorizationTokens`, encrypted
+with AES-256-GCM and bound to the account, Apple client and Apple subject. Public
+profile/session responses and owner database inspection do not expose it.
+
+`AUTH_SECRET` also derives the encryption key for these grants. Keep it stable
+across server instances and deployments. Rotating it requires a separate grant
+re-encryption plan; it must not be changed as a routine deployment step.
+
+The existing account DELETE route revokes all stored Apple grants at Apple's
+`/auth/revoke` endpoint before deleting or disabling the account. Failure returns
+503 and preserves account data for retry. A concurrent fresh authorization
+returns 409 instead of deleting it under an older snapshot. An older Apple
+account without a saved grant must sign in with Apple again before deletion;
+the previous implementation did not retain a token that could be recovered.
+Existing financial/evidence retention rules still apply after revocation.
+
+See Apple's [revocation endpoint](https://developer.apple.com/documentation/signinwithapplerestapi/revoke-tokens)
+and [account deletion guidance](https://developer.apple.com/help/app-review/guideline-reference/5-1-1-account-deletion/).
+
+## Listing Image Storage
+
+For production, use hosted S3-compatible image storage such as Cloudflare R2:
+
+```env
+SMARTSTORE_IMAGE_STORAGE=s3
+SMARTSTORE_OBJECT_STORAGE_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
+SMARTSTORE_OBJECT_STORAGE_BUCKET=smartstore-listings
+SMARTSTORE_OBJECT_STORAGE_ACCESS_KEY_ID=...
+SMARTSTORE_OBJECT_STORAGE_SECRET_ACCESS_KEY=...
+SMARTSTORE_OBJECT_STORAGE_REGION=auto
+SMARTSTORE_OBJECT_STORAGE_PUBLIC_URL=https://PUBLIC_BUCKET_OR_CDN_DOMAIN
+SMARTSTORE_OBJECT_STORAGE_TIMEOUT_MS=30000
+SMARTSTORE_MAX_IMAGES_PER_LISTING=8
+```
+
+Keep object storage access keys in the Render production secret file.
+`SMARTSTORE_OBJECT_STORAGE_TIMEOUT_MS` caps S3-compatible upload and delete
+requests so a stalled image provider cannot hold the request open indefinitely.
+`SMARTSTORE_MAX_IMAGES_PER_LISTING` defaults to `8` when unset. Production can
+lower this value, but the application caps it at `8` to protect storage,
+bandwidth, and listing page work.
+
+## Manual Commission Payment Methods
+
+The seller commissions page can show manual payment instructions for Al Rajhi,
+SNB, and STC Pay. Add only the methods you want to display; any empty method is
+hidden automatically.
+
+```env
+SMARTSTORE_COMMISSION_ALRAJHI_ACCOUNT_NAME=سوق حمد
+SMARTSTORE_COMMISSION_ALRAJHI_ACCOUNT_NUMBER=...
+SMARTSTORE_COMMISSION_ALRAJHI_IBAN=SA...
+
+SMARTSTORE_COMMISSION_SNB_ACCOUNT_NAME=سوق حمد
+SMARTSTORE_COMMISSION_SNB_ACCOUNT_NUMBER=...
+SMARTSTORE_COMMISSION_SNB_IBAN=SA...
+
+SMARTSTORE_COMMISSION_STC_PAY_NAME=سوق حمد
+SMARTSTORE_COMMISSION_STC_PAY_ACCOUNT=...
+```
+
+`SMARTSTORE_COMMISSION_STC_PAY_ACCOUNT` holds the STC Pay account number and is
+shown to sellers as "رقم الحساب". `SMARTSTORE_COMMISSION_STC_PAY_NUMBER` is
+accepted as a legacy alias when `..._ACCOUNT` is not set. Set only one of them
+in production; the account key takes priority when both are present.
+
+Keep these values in the Render production secret file. Deploy the updated
+service configuration to apply a change to payment recipients.
+
+`SMARTSTORE_OBJECT_STORAGE_PUBLIC_URL` must be a public bucket URL or CDN URL that can serve uploaded listing images in the browser. If `SMARTSTORE_IMAGE_STORAGE` is empty, the app keeps the local development fallback.
+
+## Shared Chat Rate Limiting
+
+For multi-instance production deployments, add Upstash Redis REST credentials:
+
+```env
+SMARTSTORE_RATE_LIMIT_BACKEND=redis
+SMARTSTORE_RATE_LIMIT_REDIS_TIMEOUT_MS=2000
+UPSTASH_REDIS_REST_URL=...
+UPSTASH_REDIS_REST_TOKEN=...
+```
+
+Without Redis credentials, the app still rate-limits chat requests in memory, which is acceptable for local development and single-instance testing.
+`SMARTSTORE_RATE_LIMIT_REDIS_TIMEOUT_MS` keeps Redis failures from delaying
+customer requests for longer than the configured guardrail.

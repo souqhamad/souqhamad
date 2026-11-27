@@ -1,6 +1,4 @@
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { constants } from 'node:os';
 import { startNotificationDeliveryPump } from './notification-delivery-pump.mjs';
 
 const minimumSupportedNodeMajor = 22;
@@ -33,30 +31,19 @@ function getMarketplaceStoreMode() {
   );
 }
 
-function assertProductionEnvironment() {
-  if (process.env.NODE_ENV !== 'production') return;
+function assertProductionDatabaseStoreMode() {
+  if (process.env.NODE_ENV !== 'production') {
+    return;
+  }
 
-  if (getMarketplaceStoreMode() !== 'database') {
-    throw new Error('SMARTSTORE_MARKETPLACE_STORE must be "database" in production.');
+  if (getMarketplaceStoreMode() === 'database') {
+    return;
   }
-  process.env.SMARTSTORE_MARKETPLACE_STORE = 'database';
 
-  const databaseUrl = process.env.DATABASE_URL?.trim();
-  let database;
-  try {
-    database = new URL(databaseUrl);
-  } catch {
-    // Validation failures must not include the connection string.
-  }
-  if (!database?.hostname || !['postgresql:', 'postgres:'].includes(database.protocol) || database.pathname.length < 2) {
-    throw new Error('DATABASE_URL must identify a PostgreSQL database in production.');
-  }
-  process.env.DATABASE_URL = databaseUrl;
-
-  const authSecret = process.env.AUTH_SECRET?.trim();
-  if (!authSecret || authSecret.length < 32 || /^(?:replace[ _-]|development-only-)/i.test(authSecret)) {
-    throw new Error('AUTH_SECRET must contain at least 32 characters and be set to a production value.');
-  }
+  console.error(
+    '[startup] SMARTSTORE_MARKETPLACE_STORE must be "database" in production.',
+  );
+  process.exit(1);
 }
 
 function shouldRunDatabaseMigrations() {
@@ -66,9 +53,14 @@ function shouldRunDatabaseMigrations() {
 
 function runDatabaseMigrations() {
   return new Promise((resolve, reject) => {
-    const migration = spawn(process.execPath, ['node_modules/prisma/build/index.js', 'migrate', 'deploy'], {
+    const prismaBin =
+      process.platform === 'win32'
+        ? 'node_modules\\.bin\\prisma.cmd'
+        : 'node_modules/.bin/prisma';
+    const migration = spawn(prismaBin, ['migrate', 'deploy'], {
       env: process.env,
       stdio: 'inherit',
+      shell: process.platform === 'win32',
     });
 
     migration.on('error', reject);
@@ -90,13 +82,7 @@ function runDatabaseMigrations() {
 }
 
 assertSupportedNodeVersion();
-process.env.NODE_ENV ||= 'production';
-try {
-  assertProductionEnvironment();
-} catch (error) {
-  console.error(`[startup] ${error.message}`);
-  process.exit(1);
-}
+assertProductionDatabaseStoreMode();
 
 if (shouldRunDatabaseMigrations()) {
   console.log('[startup] applying database migrations...');
@@ -112,28 +98,21 @@ const gracefulShutdownMs = Number.isFinite(shutdownGraceMs)
   ? Math.max(0, shutdownGraceMs)
   : 10_000;
 
-// The supervisor and its Next.js child share a fresh token for notification retries.
-const useNotificationPump = getMarketplaceStoreMode() === 'database';
-const notificationToken = useNotificationPump ? randomBytes(32).toString('hex') : '';
-const stopNotificationPump = startNotificationDeliveryPump({
-  port, secret: notificationToken, enabled: useNotificationPump,
-});
 const child = spawn(
   process.execPath,
   ['node_modules/next/dist/bin/next', 'start', '-H', '0.0.0.0', '-p', port],
   {
-    env: { ...process.env, SMARTSTORE_NOTIFICATION_PUMP_TOKEN: notificationToken },
+    env: process.env,
     stdio: 'inherit',
   },
 );
 
 let shuttingDown = false;
-child.once('exit', stopNotificationPump);
-child.once('error', () => {
-  stopNotificationPump();
-  console.error('[startup] Could not start the Next.js process.');
-  process.exit(1);
+const stopNotificationPump = startNotificationDeliveryPump({ port,
+  secret: process.env.SMARTSTORE_IMAGE_WORKER_SECRET,
+  enabled: getMarketplaceStoreMode() === 'database',
 });
+child.once('exit', stopNotificationPump);
 
 function forwardSignal(signal) {
   if (shuttingDown) {
@@ -160,5 +139,10 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
 }
 
 child.on('exit', (code, signal) => {
-  process.exit(signal ? 128 + constants.signals[signal] : (code ?? 1));
+  if (signal) {
+    process.kill(process.pid, signal);
+    return;
+  }
+
+  process.exit(code ?? 0);
 });

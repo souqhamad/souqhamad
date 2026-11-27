@@ -1,0 +1,66 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+import { appCopy } from '@/app/i18n';
+import { customerLanguageInstructions, getArabicCustomerMessage, isArabicCustomerText, resolveCustomerLanguage } from '@/lib/customer-language';
+import { getSafeAssistantText } from '@/lib/chat-response-safety';
+import { getAuthRequiredResponse, getComplianceBlockResponse, getComplianceReviewResponse } from '@/agent/marketplace/policy';
+
+test('Arabic is used even for old English preferences or another requested locale', () => {
+  for (const value of ['ar', 'en', 'fr', 'zh', undefined, null, { language: 'en' }]) {
+    assert.equal(resolveCustomerLanguage(value), 'ar');
+  }
+  assert.equal(appCopy.ar, appCopy.en);
+  assert.equal(appCopy.en.direction, 'rtl');
+  const check = (value: unknown) => {
+    if (typeof value === 'string') assert.ok(isArabicCustomerText(value), value);
+    else if (value && typeof value === 'object') Object.values(value).forEach(check);
+  };
+  // Direction is an HTML attribute, not displayed text.
+  const { direction, ...copy } = appCopy.ar;
+  assert.equal(direction, 'rtl');
+  check(copy);
+});
+
+test('foreign-language prose is not displayed even in a mixed-language assistant reply', () => {
+  for (const text of ['Hello, how can I help?', 'تم الحفظ. Please continue.', 'Bonjour', '你好', 'المنتج iPhone متوفر']) {
+    assert.equal(isArabicCustomerText(text), false, text);
+    assert.equal(getSafeAssistantText(text), '', text);
+  }
+  assert.equal(getSafeAssistantText('تم تجهيز مسودة إعلانك.'), 'تم تجهيز مسودة إعلانك.');
+  assert.ok(customerLanguageInstructions.includes('Arabic only'));
+});
+
+test('Arabic replies preserve functional links and authentication protocol markers', () => {
+  for (const text of [
+    'افتح [الإعلان](/listings/example-id?source=chat).',
+    'راجع [التفاصيل](/listings/example-id).',
+    '[[SMARTSTORE_GOOGLE_AUTH_REQUIRED]] يرجى تسجيل الدخول.',
+  ]) assert.equal(getSafeAssistantText(text), text);
+  assert.equal(getSafeAssistantText('راجع [التفاصيل](https://souqhamad.com/listings/example-id).'), 'راجع [التفاصيل](/listings/example-id).');
+  assert.equal(getSafeAssistantText('[Open listing](https://souqhamad.com/listings/example-id)'), '');
+});
+
+test('raw English API errors use Arabic fallback without translating stored listing data', () => {
+  const fallback = 'تعذر إكمال الإجراء الآن.';
+  for (const value of ['listing_not_found', 'Network error', 'تم الحفظ. Error', undefined, null]) {
+    assert.equal(getArabicCustomerMessage(value, fallback), fallback);
+  }
+  assert.equal(getArabicCustomerMessage('  لا يمكن نشر الإعلان الآن.  ', fallback), 'لا يمكن نشر الإعلان الآن.');
+  assert.equal(getArabicCustomerMessage(undefined, ''), '');
+});
+
+test('static auth and policy replies remain Arabic for all accepted language arguments', () => {
+  for (const response of [getAuthRequiredResponse, getComplianceBlockResponse, getComplianceReviewResponse]) {
+    assert.equal(response('en'), response('ar'));
+    assert.ok(isArabicCustomerText(response('en')));
+  }
+});
+
+test('server and client guard generated replies without page-specific rendering checks', () => {
+  const route = readFileSync('app/api/chat/route.ts', 'utf8');
+  const model = readFileSync('lib/chat/hamad-structured-model.ts', 'utf8');
+  assert.match(route, /getAuthRequiredResponse\('ar'\)/);
+  assert.match(route, /createChatResponse\(async \(\) => \(\{ text \}\), async \(\) => \{\}, getHamadCustomerReply\)/);
+  assert.match(model, /Reply naturally and concisely in Saudi Arabic/);
+});

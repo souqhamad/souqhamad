@@ -1,0 +1,58 @@
+#!/usr/bin/env node
+
+import { spawnSync } from 'node:child_process';
+import { mkdirSync } from 'node:fs';
+import { basename, resolve } from 'node:path';
+import { localExecutable } from '../../../scripts/dev-tools/local-executable.mjs';
+
+const scenario = process.argv[2];
+
+if (!scenario || process.argv.includes('--help')) {
+  console.log('Usage: node tests/load/scripts/run-k6.mjs <scenario.js> [-- <k6 args>]');
+  process.exit(scenario ? 0 : 1);
+}
+
+const passthroughIndex = process.argv.indexOf('--');
+const passthroughArgs =
+  passthroughIndex === -1 ? process.argv.slice(3) : process.argv.slice(passthroughIndex + 1);
+const scenarioPath = resolve(process.cwd(), scenario);
+const reportDir = resolve(process.cwd(), 'tests/load/reports');
+mkdirSync(reportDir, { recursive: true });
+
+const reportName = `${basename(scenario, '.js')}-${new Date()
+  .toISOString()
+  .replace(/[:.]/g, '-')}.json`;
+const env = {
+  ...process.env,
+  K6_REPORT_FILE: process.env.K6_REPORT_FILE || `tests/load/reports/${reportName}`,
+};
+
+if (env.K6_MAX_VUS && !env.SMARTSTORE_LOAD_MAX_VUS) {
+  env.SMARTSTORE_LOAD_MAX_VUS = env.K6_MAX_VUS;
+}
+
+if (env.K6_DURATION && !env.SMARTSTORE_LOAD_DURATION) {
+  env.SMARTSTORE_LOAD_DURATION = env.K6_DURATION;
+}
+
+delete env.K6_MAX_VUS;
+delete env.K6_DURATION;
+
+let executable;
+try {
+  executable = localExecutable('k6');
+} catch (error) {
+  console.error(error.message);
+  console.error('Install it from https://grafana.com/docs/k6/latest/set-up/install-k6/.');
+  process.exit(1);
+}
+
+const result = spawnSync(executable, ['run', scenarioPath, ...passthroughArgs], {
+  cwd: process.cwd(),
+  env,
+  stdio: 'inherit',
+});
+
+if (result.error) console.error(result.error.message);
+
+process.exit(result.status ?? 1);

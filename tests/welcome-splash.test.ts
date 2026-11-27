@@ -1,0 +1,269 @@
+import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import test from 'node:test';
+
+import {
+  APP_READY_FLAG,
+  APP_DISPLAY_MODE_ATTR,
+  APP_DISPLAY_MODE_STANDALONE,
+  buildWelcomeInitScript,
+  WELCOME_COOKIE_NAME,
+  WELCOME_FADE_MS,
+  WELCOME_ID,
+  WELCOME_SESSION_KEY,
+  WELCOME_STANDALONE_FADE_MS,
+  WELCOME_STANDALONE_VISIBLE_MS,
+  WELCOME_VISIBLE_MS,
+} from '@/lib/welcome/config';
+
+test('welcome init script references the shared session key', () => {
+  const script = buildWelcomeInitScript();
+
+  assert.ok(
+    script.includes(WELCOME_SESSION_KEY),
+    'script must read the same sessionStorage key as the component',
+  );
+  assert.ok(
+    script.includes(WELCOME_COOKIE_NAME),
+    'script must also read the cookie fallback before paint',
+  );
+});
+
+test('welcome init script hides the overlay before paint for returning visits', () => {
+  const script = buildWelcomeInitScript();
+
+  // It must set the skip flag the CSS relies on to avoid a flash.
+  assert.match(script, /setAttribute\('data-welcome','skip'\)/);
+  assert.match(script, /setAttribute\('data-welcome','show'\)/);
+  // And it must respect reduced-motion users.
+  assert.match(script, /prefers-reduced-motion: reduce/);
+});
+
+test('welcome init script marks installed app display mode before paint', () => {
+  const script = buildWelcomeInitScript();
+
+  assert.ok(script.includes(APP_DISPLAY_MODE_ATTR));
+  assert.ok(script.includes(APP_DISPLAY_MODE_STANDALONE));
+  assert.match(script, /navigator\.standalone/);
+  assert.match(script, /display-mode: standalone/);
+});
+
+test('welcome init script is a self-contained IIFE', () => {
+  const script = buildWelcomeInitScript();
+
+  assert.ok(script.startsWith('(function(){'));
+  assert.ok(script.endsWith('})();'));
+});
+
+test('returning visits reveal the app before paint', () => {
+  const script = buildWelcomeInitScript();
+
+  // The welcome overlay must be skipped instantly so no launch screen lingers
+  // for a returning visitor.
+  assert.match(script, /data-welcome','skip'/);
+  assert.ok(
+    script.includes(`${APP_READY_FLAG}','1'`) ||
+      script.includes(`'${APP_READY_FLAG}','1'`),
+    'returning visits must set the app-ready flag',
+  );
+  assert.doesNotMatch(
+    script,
+    /removeChild|getElementById\('${WELCOME_ID}'\)/,
+    'the head script must not remove React-owned welcome DOM during client navigation',
+  );
+});
+
+test('welcome overlay uses a stable id and sane timings', () => {
+  assert.equal(WELCOME_ID, 'smartstore-welcome');
+  assert.ok(WELCOME_VISIBLE_MS >= 1000, 'overlay should stay long enough to register');
+  assert.ok(WELCOME_VISIBLE_MS <= 1800, 'overlay should not delay first page paint');
+  assert.ok(WELCOME_FADE_MS >= 240, 'fade should be smooth');
+  assert.ok(WELCOME_FADE_MS <= 500, 'fade should not feel sluggish');
+  assert.ok(
+    WELCOME_VISIBLE_MS + WELCOME_FADE_MS <= 2000,
+    'welcome should stay intentional without blocking the app for too long',
+  );
+  assert.ok(
+    WELCOME_STANDALONE_VISIBLE_MS < WELCOME_VISIBLE_MS,
+    'installed app welcome should be shorter after the native launch screen',
+  );
+  assert.ok(WELCOME_STANDALONE_FADE_MS <= WELCOME_FADE_MS);
+  assert.ok(
+    WELCOME_STANDALONE_VISIBLE_MS + WELCOME_STANDALONE_FADE_MS <= 1400,
+    'installed app welcome should finish quickly after the native launch screen',
+  );
+});
+
+test('welcome logo asset exists in public assets', () => {
+  assert.equal(
+    existsSync(join(process.cwd(), 'public', 'hamad-market-logo.jpeg')),
+    true,
+  );
+  assert.equal(
+    existsSync(join(process.cwd(), 'public', 'hamad-market-wordmark.png')),
+    true,
+  );
+});
+
+test('welcome component uses the market logo as a single foreground brand layer', () => {
+  const component = readFileSync(
+    join(process.cwd(), 'components', 'app-welcome-splash.tsx'),
+    'utf8',
+  );
+
+  assert.match(component, /\/hamad-market-wordmark\.webp/);
+  assert.doesNotMatch(component, /\/hamad-market-logo\.jpeg/);
+  assert.doesNotMatch(component, /--app-welcome-bg/);
+  assert.match(component, /سوقك الذكي للبيع والشراء/);
+  assert.doesNotMatch(component, /app-welcome__logo/);
+  assert.doesNotMatch(component, /app-welcome__title/);
+  assert.doesNotMatch(component, /\/smartstore-logo\.png/);
+});
+
+test('welcome brand wordmark is centered and kept at a professional size', () => {
+  const globals = readFileSync(join(process.cwd(), 'app', 'globals.css'), 'utf8');
+  const layout = readFileSync(join(process.cwd(), 'app', 'layout.tsx'), 'utf8');
+
+  for (const source of [globals, layout]) {
+    assert.match(source, /app-welcome__brand[\s\S]*left: 50%/);
+    assert.match(source, /app-welcome__brand[\s\S]*top: 42%/);
+    assert.match(source, /app-welcome__brand[\s\S]*width: min\(78vw, 26rem\)/);
+    assert.match(source, /app-welcome__brand[\s\S]*height: auto/);
+    assert.match(source, /app-welcome__brand[\s\S]*transform: translate\(-50%, -50%\)/);
+    assert.match(source, /@media \(min-width: 1024px\) and \(orientation: landscape\)/);
+    assert.match(source, /@media \(min-width: 1024px\) and \(orientation: landscape\)[\s\S]*width: min\(36vw, 34rem\)/);
+    assert.doesNotMatch(source, /app-welcome__brand[\s\S]{0,500}object-fit: cover/);
+    assert.doesNotMatch(source, /app-welcome__brand[^{]*\{[^}]*width: 100%/);
+    assert.doesNotMatch(source, /app-welcome__brand[^{]*\{[^}]*height: 100%/);
+    assert.doesNotMatch(source, /width: min\(132vw, 760px\)/);
+    assert.doesNotMatch(source, /width: min\(96vw, 980px\)/);
+    assert.doesNotMatch(source, /width: min\(82vw, 1100px\)/);
+  }
+});
+
+test('welcome background does not duplicate the brand image behind itself', () => {
+  const globals = readFileSync(join(process.cwd(), 'app', 'globals.css'), 'utf8');
+  const layout = readFileSync(join(process.cwd(), 'app', 'layout.tsx'), 'utf8');
+
+  for (const source of [globals, layout]) {
+    assert.doesNotMatch(source, /app-welcome::before[\s\S]{0,360}background-image: var\(--app-welcome-bg\)/);
+    assert.doesNotMatch(source, /smartstore-welcome::before[\s\S]{0,360}background-image: var\(--app-welcome-bg\)/);
+    assert.doesNotMatch(source, /app-welcome::before[\s\S]{0,360}filter: blur\(18px\) saturate\(1\.1\)/);
+    assert.doesNotMatch(source, /smartstore-welcome::before[\s\S]{0,360}filter: blur\(18px\) saturate\(1\.1\)/);
+    assert.doesNotMatch(source, /app-welcome::before[\s\S]{0,360}transform: scale\(1\.12\)/);
+    assert.doesNotMatch(source, /smartstore-welcome::before[\s\S]{0,360}transform: scale\(1\.12\)/);
+    assert.match(source, /radial-gradient\(circle at 50% 28%/);
+    assert.match(source, /linear-gradient\(160deg/);
+  }
+});
+
+test('welcome component records the visit before its removal timer', () => {
+  const component = readFileSync(
+    join(process.cwd(), 'components', 'app-welcome-splash.tsx'),
+    'utf8',
+  );
+  const storageIndex = component.indexOf('window.sessionStorage.setItem');
+  const cookieIndex = component.indexOf('document.cookie');
+  const timerIndex = component.indexOf('window.setTimeout');
+
+  assert.ok(storageIndex > -1, 'component should record the viewed welcome');
+  assert.ok(cookieIndex > -1, 'component should write a cookie fallback');
+  assert.ok(timerIndex > -1, 'component should still remove itself after the CSS lifecycle');
+  assert.ok(
+    storageIndex < timerIndex,
+    'welcome should be marked seen before a route change can cancel the timer',
+  );
+  assert.ok(
+    cookieIndex < timerIndex,
+    'welcome cookie fallback should be written before route changes can cancel the timer',
+  );
+  assert.match(
+    component,
+    /welcomeState !== 'show'/,
+    'component should not start the overlay lifecycle unless the head script explicitly opted in',
+  );
+});
+
+test('welcome surfaces use the dark teal brand palette', () => {
+  const globals = readFileSync(join(process.cwd(), 'app', 'globals.css'), 'utf8');
+  const layout = readFileSync(join(process.cwd(), 'app', 'layout.tsx'), 'utf8');
+
+  for (const source of [globals, layout]) {
+    assert.match(source, /#08111d/);
+    assert.match(source, /#117c8b/);
+  }
+});
+
+test('welcome css includes a shorter standalone lifecycle', () => {
+  const globals = readFileSync(join(process.cwd(), 'app', 'globals.css'), 'utf8');
+
+  assert.match(globals, /\[data-app-display="standalone"\] \.app-welcome/);
+  assert.match(globals, /app-welcome-standalone-lifecycle/);
+});
+
+test('welcome content fades only with the overlay background', () => {
+  const globals = readFileSync(join(process.cwd(), 'app', 'globals.css'), 'utf8');
+  const layout = readFileSync(join(process.cwd(), 'app', 'layout.tsx'), 'utf8');
+
+  assert.match(globals, /app-welcome-lifecycle 1720ms/);
+  assert.match(globals, /animation: app-welcome-rise 820ms/);
+  assert.match(globals, /animation-duration: 640ms/);
+  assert.doesNotMatch(globals, /app-welcome-content-exit/);
+  assert.doesNotMatch(globals, /app-welcome-standalone-content-exit/);
+  assert.match(layout, /app-welcome-lifecycle \$\{welcomeLifecycleMs\}ms/);
+  assert.match(layout, /animation-duration: \$\{welcomeStandaloneLifecycleMs\}ms/);
+});
+
+test('welcome overlay is opt-in and has no independent boot cover', () => {
+  const layout = readFileSync(join(process.cwd(), 'app', 'layout.tsx'), 'utf8');
+
+  assert.match(layout, /#smartstore-welcome[\s\S]*display: none/);
+  assert.match(layout, /html\[data-welcome='show'\] #smartstore-welcome \{ display: flex; \}/);
+  assert.match(layout, /html\[data-welcome='skip'\] #smartstore-welcome/);
+  assert.doesNotMatch(layout, /smartstore-boot-cover/);
+  assert.doesNotMatch(layout, /smartstore-app-shell-fallback/);
+});
+
+test('welcome has critical first-paint styles in the document head', () => {
+  const layout = readFileSync(join(process.cwd(), 'app', 'layout.tsx'), 'utf8');
+
+  assert.ok(
+    layout.indexOf('id="smartstore-native-viewport-init"') <
+      layout.indexOf('id="smartstore-welcome-init"'),
+    'native app viewport state must be marked before the welcome script and first paint',
+  );
+  assert.ok(
+    layout.indexOf('id="smartstore-welcome-init"') <
+      layout.indexOf('id="smartstore-welcome-critical-style"'),
+    'welcome state must be decided before the critical welcome CSS can paint',
+  );
+  assert.match(layout, /#smartstore-welcome \{/);
+  assert.match(layout, /z-index: 9999/);
+  assert.match(layout, /html\[data-app-display='standalone'\] #smartstore-welcome/);
+  assert.match(layout, /app-welcome-standalone-lifecycle/);
+});
+
+test('welcome presentation avoids the old floating glow treatment', () => {
+  const component = readFileSync(
+    join(process.cwd(), 'components', 'app-welcome-splash.tsx'),
+    'utf8',
+  );
+  const globals = readFileSync(join(process.cwd(), 'app', 'globals.css'), 'utf8');
+
+  assert.match(component, /app-welcome__backdrop/);
+  assert.doesNotMatch(component, /app-welcome__glow/);
+  assert.doesNotMatch(globals, /app-welcome-pulse/);
+  assert.doesNotMatch(globals, /app-welcome-float/);
+  assert.doesNotMatch(globals, /app-welcome-sheen/);
+});
+
+test('welcome background stays smooth without grid texture', () => {
+  const globals = readFileSync(join(process.cwd(), 'app', 'globals.css'), 'utf8');
+  const layout = readFileSync(join(process.cwd(), 'app', 'layout.tsx'), 'utf8');
+
+  for (const source of [globals, layout]) {
+    assert.doesNotMatch(source, /44px 44px/);
+    assert.doesNotMatch(source, /0 1px, transparent 1px 100%/);
+  }
+});

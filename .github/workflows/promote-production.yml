@@ -1,0 +1,53 @@
+name: Promote Verified Production
+
+on:
+  workflow_run:
+    workflows: [Production Gate]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verified-production-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository &&
+          github.event.repository.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      # Use trusted default-branch tooling, never code/artifacts from an untrusted run.
+      - name: Checkout trusted promotion tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Promote and request deployment of the verified main commit
+        run: node scripts/deploy/promote-verified-production.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+
+      - name: Preserve promotion verification
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-promotion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: coverage/production-promotion.json
+          if-no-files-found: error
+          retention-days: 14

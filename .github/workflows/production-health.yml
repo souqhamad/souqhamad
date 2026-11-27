@@ -1,0 +1,42 @@
+name: Production Health
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC minute 23, separate from the image Worker's minute-17 maintenance.
+    - cron: '23 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-health
+  cancel-in-progress: false
+
+jobs:
+  health:
+    name: Canonical Server And Database Health
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Check public production health once
+        run: node scripts/monitoring/check-production-health.mjs
+
+      - name: Preserve bounded health result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-health-${{ github.run_id }}-${{ github.run_attempt }}
+          path: coverage/production-health-check.json
+          if-no-files-found: error
+          retention-days: 3

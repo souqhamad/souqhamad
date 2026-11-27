@@ -1,0 +1,293 @@
+name: Production Gate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality, Build, And Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 10.32.1
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: TypeScript
+        run: pnpm exec tsc --noEmit
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Unit and integration-safe tests
+        run: pnpm test
+
+      - name: Image processing Worker contracts
+        run: pnpm test:images:worker
+
+      - name: Production build
+        run: pnpm build
+        env:
+          AUTH_SECRET: ci-only-smartstore-auth-secret-with-enough-length
+          DEEPSEEK_API_KEY: ci-placeholder
+          SMARTSTORE_MARKETPLACE_STORE: file
+
+      - name: Dependency audit
+        run: pnpm audit --audit-level moderate
+
+  e2e:
+    name: Browser E2E (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - desktop-chromium
+          - mobile-chromium-layout
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 10.32.1
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run E2E journey tests
+        timeout-minutes: 35
+        run: pnpm test:e2e --project=${{ matrix.project }}
+        env:
+          AUTH_SECRET: ci-only-smartstore-auth-secret-with-enough-length
+          DEEPSEEK_API_KEY: ci-placeholder
+          SMARTSTORE_MARKETPLACE_STORE: file
+
+      - name: Upload Playwright reports
+        if: ${{ always() }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-${{ matrix.project }}-${{ github.run_attempt }}
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  api-contracts:
+    name: Server API Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 10.32.1
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run request-only API contracts
+        timeout-minutes: 35
+        run: pnpm test:e2e --project=api-contracts
+        env:
+          AUTH_SECRET: ci-only-smartstore-auth-secret-with-enough-length
+          DEEPSEEK_API_KEY: ci-placeholder
+          SMARTSTORE_MARKETPLACE_STORE: file
+
+      - name: Upload API contract reports
+        if: ${{ always() }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-api-contracts-${{ github.run_attempt }}
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  mobile-contracts:
+    name: Mobile And PostgreSQL Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:18.3
+        env:
+          POSTGRES_USER: codex_local
+          POSTGRES_PASSWORD: ci-only-disposable-postgres-password
+          POSTGRES_DB: smartstore_codex_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U codex_local -d smartstore_codex_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # This database belongs to this disposable job; no hosted database secret is used.
+      DATABASE_URL: postgresql://codex_local:ci-only-disposable-postgres-password@127.0.0.1:55432/smartstore_codex_test?schema=public
+      SMARTSTORE_CI_DB_TESTS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout pinned native application
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mahersss024-oss/app
+          # Update deliberately when validating a new server/mobile version pair.
+          ref: a603c668c19bd2ee703843481cd344975d250452
+          path: AI
+          ssh-key: ${{ secrets.MOBILE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 10.32.1
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            AI/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install native application dependencies
+        working-directory: AI
+        run: pnpm install --frozen-lockfile
+
+      - name: Native application types and lint
+        working-directory: AI
+        run: pnpm check
+
+      - name: Install Chromium for native React reconciliation tests
+        working-directory: AI
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Native application tests
+        working-directory: AI
+        run: pnpm test
+
+      - name: Verify mobile operations and isolated PostgreSQL contracts
+        timeout-minutes: 15
+        run: pnpm test:mobile-contracts --run-node --run-mobile --run-postgres
+
+      - name: Upload mobile backend contract reports
+        if: ${{ always() }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mobile-backend-contracts-${{ github.run_attempt }}
+          path: |
+            coverage/mobile-*.json
+            coverage/mobile-*.md
+            coverage/mobile-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  production-readiness:
+    name: Production Readiness
+    if: ${{ always() }}
+    needs: [quality, e2e, api-contracts, mobile-contracts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Require all automated checks to succeed
+        run: node scripts/testing/check-production-readiness.mjs
+        env:
+          REQUIRED_JOB_RESULTS: ${{ toJSON(needs) }}
+
+  optional-db-integration:
+    name: Optional Staging DB Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ vars.RUN_STAGING_DB_INTEGRATION == '1' }}
+    env:
+      DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+      SMARTSTORE_DB_INTEGRATION: "1"
+      SMARTSTORE_MARKETPLACE_STORE: database
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 10.32.1
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Deploy migrations to staging database
+        run: pnpm db:deploy
+
+      - name: Run staging database integration test
+        run: pnpm test:db:integration
